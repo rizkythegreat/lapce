@@ -1163,11 +1163,17 @@ impl PluginCatalogRpcHandler {
         let language_id =
             Some(language_id_from_path(path).unwrap_or("").to_string());
 
-        self.send_request_to_all_plugins(
+        // Unlike most requests, completion merges the items of every server,
+        // such as TypeScript and Tailwind CSS, so deliver each response
+        // instead of only the first successful one.
+        self.send_request(
+            None,
+            None,
             method,
             params,
             language_id,
             Some(path.to_path_buf()),
+            true,
             move |plugin_id, result| match result {
                 Ok(value) => {
                     if let Ok(resp) =
