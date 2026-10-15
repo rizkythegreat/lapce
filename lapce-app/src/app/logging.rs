@@ -25,10 +25,18 @@ pub(super) fn logging() -> (Handle<Targets>, Option<WorkerGuard>) {
         None => (None, None),
     };
 
+    // Debug logs include every language server message, which can be
+    // megabytes per keystroke for servers such as Tailwind CSS, so only
+    // write them in debug builds.
+    let level = if cfg!(debug_assertions) {
+        LevelFilter::DEBUG
+    } else {
+        LevelFilter::INFO
+    };
     let log_file_filter_targets = filter::Targets::new()
-        .with_target("lapce_app", LevelFilter::DEBUG)
-        .with_target("lapce_proxy", LevelFilter::DEBUG)
-        .with_target("lapce_core", LevelFilter::DEBUG)
+        .with_target("lapce_app", level)
+        .with_target("lapce_proxy", level)
+        .with_target("lapce_core", level)
         .with_default(LevelFilter::from_level(TraceLevel::INFO));
     let (log_file_filter, reload_handle) =
         reload::Subscriber::new(log_file_filter_targets);
