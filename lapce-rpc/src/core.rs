@@ -427,6 +427,15 @@ pub struct ServerStatusParams {
 }
 
 impl ServerStatusParams {
+    /// The status of a language server that has finished initializing.
+    pub fn ready() -> Self {
+        Self {
+            health: "ok".to_string(),
+            quiescent: true,
+            message: None,
+        }
+    }
+
     pub fn is_ok(&self) -> bool {
         self.health.as_str() == "ok"
     }

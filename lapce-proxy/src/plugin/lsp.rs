@@ -13,6 +13,7 @@ use jsonrpc_lite::{Id, Params};
 use lapce_core::meta;
 use lapce_rpc::{
     RpcError,
+    core::ServerStatusParams,
     plugin::{PluginId, VoltID},
     style::LineStyle,
 };
@@ -444,6 +445,13 @@ impl LspClient {
                 {
                     self.server_rpc.shutdown();
                     self.shutdown();
+                } else {
+                    // Let the editor request semantic tokens, code lenses, and
+                    // inlay hints now instead of after the first edit, so the
+                    // highlighting does not change while typing.
+                    self.plugin_rpc
+                        .core_rpc
+                        .server_status(ServerStatusParams::ready());
                 }
             }
             Err(err) => {
