@@ -1,0 +1,109 @@
+# Unsigned (ad-hoc signed) Apple Silicon build of a fork, for personal use.
+#
+# The official release workflow needs Apple signing and notarization secrets
+# that forks do not have. This workflow produces "Lapce Split.app" with its own
+# bundle identifier, so it can be installed next to the official Lapce.app.
+# The self-updater is disabled, so the app never replaces itself with an
+# upstream release. See docs/custom-macos-build.md.
+
+name: Custom macOS build
+
+on:
+  push:
+    branches:
+      - feat/split-terminal
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Cargo profile (release-lto is smaller and faster but takes much longer to build)"
+        type: choice
+        options:
+          - release
+          - release-lto
+        default: release
+
+concurrency:
+  group: ${{ github.ref }}-${{ github.workflow }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  APP_NAME: Lapce Split
+  PROFILE: ${{ inputs.profile || 'release' }}
+
+permissions: {}
+
+jobs:
+  macos-arm64:
+    # Never run in the upstream repository.
+    if: github.repository != 'lapce/lapce'
+    # macos-15 runners are Apple Silicon (arm64).
+    runs-on: macos-15
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Update Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustc --version
+
+      - name: Cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
+        with:
+          key: custom-macos-${{ env.PROFILE }}
+
+      - name: Disable the self-updater
+        # Build-time only: the root package depends on lapce-app with default
+        # features, which include "updater".
+        run: |
+          sed -i '' 's|^lapce-app   = { path = "./lapce-app" }$|lapce-app   = { path = "./lapce-app", default-features = false, features = ["vendored-fonts"] }|' Cargo.toml
+          grep -q 'default-features = false, features = \["vendored-fonts"\]' Cargo.toml
+
+      - name: Build
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
+        run: cargo build --locked --profile "$PROFILE" --bin lapce
+
+      - name: Smoke test
+        run: ./target/"$PROFILE"/lapce --version
+
+      - name: Bundle and ad-hoc sign
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          bundle_id="io.github.$(echo "$GITHUB_REPOSITORY_OWNER" | tr -c 'A-Za-z0-9\n' '-').lapce-split"
+          app="dist/$APP_NAME.app"
+          plist="$app/Contents/Info.plist"
+
+          mkdir -p dist
+          cp -R extra/macos/Lapce.app "$app"
+          mkdir -p "$app/Contents/MacOS"
+          cp "target/$PROFILE/lapce" "$app/Contents/MacOS/lapce"
+
+          plutil -replace CFBundleIdentifier -string "$bundle_id" "$plist"
+          plutil -replace CFBundleName -string "$APP_NAME" "$plist"
+          plutil -replace CFBundleDisplayName -string "$APP_NAME" "$plist"
+          plutil -replace CFBundleVersion -string "$GITHUB_RUN_NUMBER" "$plist"
+          plutil -replace CFBundleGetInfoString -string "Custom build $short_sha" "$plist"
+          plutil -lint "$plist"
+
+          # "-" is an ad-hoc signature: no certificate or secret involved.
+          codesign --force --deep --sign - "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+          ditto -c -k --keepParent "$app" "dist/Lapce-Split-macos-arm64-$short_sha.zip"
+          echo "Bundle id: $bundle_id" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: lapce-split-macos-arm64
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30
