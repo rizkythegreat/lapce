@@ -245,7 +245,9 @@ impl TerminalPanelData {
                 } else {
                     let active = info.active.min(info.tabs.len().saturating_sub(1));
                     if !info.tabs.is_empty() {
-                        info.tabs.remove(active);
+                        close_tab = Some(
+                            info.tabs.remove(active).1.terminals.get_untracked(),
+                        );
                     }
                 }
                 let new_active = info.active.min(info.tabs.len().saturating_sub(1));
