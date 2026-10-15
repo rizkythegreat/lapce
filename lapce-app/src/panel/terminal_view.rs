@@ -223,16 +223,29 @@ fn terminal_tab_header(window_tab_data: Rc<WindowTabData>) -> impl View {
             let size = scroll_size.get();
             s.size(size.width, size.height).pointer_events_none()
         }),
-        container(clickable_icon(
-            || LapceIcons::ADD,
-            move || {
-                workbench_command.send(LapceWorkbenchCommand::NewTerminalTab);
-            },
-            || false,
-            || false,
-            || "New Terminal",
-            config,
-        ))
+        container(stack((
+            clickable_icon(
+                || LapceIcons::ADD,
+                move || {
+                    workbench_command.send(LapceWorkbenchCommand::NewTerminalTab);
+                },
+                || false,
+                || false,
+                || "New Terminal",
+                config,
+            ),
+            clickable_icon(
+                || LapceIcons::SPLIT_HORIZONTAL,
+                move || {
+                    workbench_command.send(LapceWorkbenchCommand::SplitTerminal);
+                },
+                || false,
+                || false,
+                || "Split Terminal",
+                config,
+            )
+            .style(|s| s.margin_left(4.0)),
+        )))
         .on_resize(move |rect| {
             let width = rect.size().width;
             if icon_width.get_untracked() != width {
@@ -275,6 +288,7 @@ fn terminal_tab_split(
     let workspace = terminal_panel_data.workspace.clone();
     let active = terminal_tab_data.active;
     let terminal_tab_scope = terminal_tab_data.scope;
+    let terminals = terminal_tab_data.terminals;
     dyn_stack(
         move || {
             let terminals = terminal_tab_data.terminals.get();
@@ -289,47 +303,68 @@ fn terminal_tab_split(
         move |(index, terminal)| {
             let terminal_panel_data = terminal_panel_data.clone();
             let terminal_scope = terminal.scope;
-            container({
-                let terminal_view = terminal_view(
-                    terminal.term_id,
-                    terminal.raw.read_only(),
-                    terminal.mode.read_only(),
-                    terminal.run_debug.read_only(),
-                    terminal_panel_data,
-                    terminal.launch_error,
-                    internal_command,
-                    workspace.clone(),
-                );
-                let view_id = terminal_view.id();
-                let have_task = terminal.run_debug.get_untracked().is_some();
-                terminal_view
-                    .on_event_cont(EventListener::PointerDown, move |_| {
-                        active.set(index.get_untracked());
-                    })
-                    .on_secondary_click_stop(move |_| {
-                        if have_task {
-                            tab_secondary_click(
-                                internal_command,
-                                view_id,
-                                tab_index,
-                                index.get_untracked(),
-                                terminal.term_id,
-                            );
-                        }
-                    })
-                    .on_event(EventListener::PointerWheel, move |event| {
-                        if let Event::PointerWheel(pointer_event) = event {
-                            terminal.clone().wheel_scroll(pointer_event.delta.y);
-                            EventPropagation::Stop
-                        } else {
-                            EventPropagation::Continue
-                        }
-                    })
-                    .on_cleanup(move || {
-                        terminal_scope.dispose();
-                    })
-                    .style(|s| s.size_pct(100.0, 100.0))
-            })
+            let term_id = terminal.term_id;
+            let close_pane = clickable_icon(
+                || LapceIcons::CLOSE,
+                move || {
+                    internal_command
+                        .send(InternalCommand::CloseTerminalPane { term_id });
+                },
+                || false,
+                || false,
+                || "Close Pane",
+                config,
+            )
+            .style(move |s| {
+                s.absolute()
+                    .inset_top(4.0)
+                    .inset_right(4.0)
+                    .apply_if(terminals.with(|t| t.len() <= 1), |s| s.hide())
+            });
+            stack((
+                {
+                    let terminal_view = terminal_view(
+                        terminal.term_id,
+                        terminal.raw.read_only(),
+                        terminal.mode.read_only(),
+                        terminal.run_debug.read_only(),
+                        terminal_panel_data,
+                        terminal.launch_error,
+                        internal_command,
+                        workspace.clone(),
+                    );
+                    let view_id = terminal_view.id();
+                    let have_task = terminal.run_debug.get_untracked().is_some();
+                    terminal_view
+                        .on_event_cont(EventListener::PointerDown, move |_| {
+                            active.set(index.get_untracked());
+                        })
+                        .on_secondary_click_stop(move |_| {
+                            if have_task {
+                                tab_secondary_click(
+                                    internal_command,
+                                    view_id,
+                                    tab_index,
+                                    index.get_untracked(),
+                                    terminal.term_id,
+                                );
+                            }
+                        })
+                        .on_event(EventListener::PointerWheel, move |event| {
+                            if let Event::PointerWheel(pointer_event) = event {
+                                terminal.clone().wheel_scroll(pointer_event.delta.y);
+                                EventPropagation::Stop
+                            } else {
+                                EventPropagation::Continue
+                            }
+                        })
+                        .on_cleanup(move || {
+                            terminal_scope.dispose();
+                        })
+                        .style(|s| s.size_pct(100.0, 100.0))
+                },
+                close_pane,
+            ))
             .style(move |s| {
                 s.size_pct(100.0, 100.0).padding_horiz(10.0).apply_if(
                     index.get() > 0,
