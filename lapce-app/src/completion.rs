@@ -116,7 +116,13 @@ impl CompletionData {
                 indices: Vec::new(),
             })
             .collect();
-        self.input_items.insert(input.to_string(), items);
+        // Several language servers can answer the same request, such as
+        // TypeScript and Tailwind CSS, so merge their items instead of letting
+        // the last response replace the others.
+        self.input_items
+            .entry(input.to_string())
+            .or_default()
+            .append(items);
         self.filter_items();
     }
 
