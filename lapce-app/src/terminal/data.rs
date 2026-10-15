@@ -262,6 +262,13 @@ impl KeyPressFocus for TerminalData {
                         },
                     );
                 }
+                FocusCommand::SplitClose => {
+                    self.common.internal_command.send(
+                        InternalCommand::CloseTerminalPane {
+                            term_id: self.term_id,
+                        },
+                    );
+                }
                 FocusCommand::SearchForward => {
                     // if let Some(search_string) = self.find.search_string.as_ref() {
                     //     let mut raw = self.terminal.raw.lock();

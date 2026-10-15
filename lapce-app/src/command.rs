@@ -325,6 +325,14 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "Close Terminal Tab")]
     CloseTerminalTab,
 
+    #[strum(serialize = "split_terminal")]
+    #[strum(message = "Split Terminal")]
+    SplitTerminal,
+
+    #[strum(serialize = "close_terminal_pane")]
+    #[strum(message = "Close Terminal Pane")]
+    CloseTerminalPane,
+
     #[strum(serialize = "next_terminal_tab")]
     #[strum(message = "Next Terminal Tab")]
     NextTerminalTab,
@@ -689,6 +697,9 @@ pub enum InternalCommand {
         term_id: TermId,
     },
     SplitTerminalExchange {
+        term_id: TermId,
+    },
+    CloseTerminalPane {
         term_id: TermId,
     },
     EditorTabClose {

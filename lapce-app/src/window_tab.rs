@@ -1102,6 +1102,17 @@ impl WindowTabData {
                     self.common.focus.set(Focus::Panel(PanelKind::Terminal));
                 }
             }
+            SplitTerminal => {
+                self.terminal.split_active();
+                if !self.panel.is_panel_visible(&PanelKind::Terminal) {
+                    self.panel.show_panel(&PanelKind::Terminal);
+                }
+                self.common.focus.set(Focus::Panel(PanelKind::Terminal));
+            }
+            CloseTerminalPane => {
+                self.terminal.close_active_pane();
+                self.update_focus_after_terminal_close();
+            }
             NextTerminalTab => {
                 self.terminal.next_tab();
                 if !self.panel.is_panel_visible(&PanelKind::Terminal) {
@@ -1924,6 +1935,10 @@ impl WindowTabData {
             InternalCommand::SplitTerminalExchange { term_id } => {
                 self.terminal.split_exchange(term_id);
             }
+            InternalCommand::CloseTerminalPane { term_id } => {
+                self.terminal.close_pane(term_id);
+                self.update_focus_after_terminal_close();
+            }
             InternalCommand::RunAndDebug { mode, config } => {
                 self.run_and_debug(cx, &mode, &config);
             }
@@ -2742,6 +2757,24 @@ impl WindowTabData {
     fn hide_panel(&self, kind: PanelKind) {
         self.panel.hide_panel(&kind);
         self.common.focus.set(Focus::Workbench);
+    }
+
+    /// After closing a terminal pane: hide the terminal panel once no terminal
+    /// tabs are left, mirroring `close_terminal_tab`.
+    fn update_focus_after_terminal_close(&self) {
+        if self
+            .terminal
+            .tab_info
+            .with_untracked(|info| info.tabs.is_empty())
+        {
+            if self.panel.is_panel_visible(&PanelKind::Terminal) {
+                self.hide_panel(PanelKind::Terminal);
+            } else if self.common.focus.get_untracked()
+                == Focus::Panel(PanelKind::Terminal)
+            {
+                self.common.focus.set(Focus::Workbench);
+            }
+        }
     }
 
     pub fn show_panel(&self, kind: PanelKind) {
