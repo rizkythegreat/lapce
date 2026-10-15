@@ -333,6 +333,14 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "Close Terminal Pane")]
     CloseTerminalPane,
 
+    #[strum(serialize = "focus_next_terminal_pane")]
+    #[strum(message = "Focus Next Terminal Pane")]
+    FocusNextTerminalPane,
+
+    #[strum(serialize = "focus_previous_terminal_pane")]
+    #[strum(message = "Focus Previous Terminal Pane")]
+    FocusPreviousTerminalPane,
+
     #[strum(serialize = "next_terminal_tab")]
     #[strum(message = "Next Terminal Tab")]
     NextTerminalTab,
@@ -700,6 +708,12 @@ pub enum InternalCommand {
         term_id: TermId,
     },
     CloseTerminalPane {
+        term_id: TermId,
+    },
+    FocusNextTerminalPane {
+        term_id: TermId,
+    },
+    FocusPreviousTerminalPane {
         term_id: TermId,
     },
     EditorTabClose {

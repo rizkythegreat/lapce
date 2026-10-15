@@ -31,7 +31,9 @@ use super::{
     raw::{EventProxy, RawTerminal},
 };
 use crate::{
-    command::{CommandExecuted, CommandKind, InternalCommand},
+    command::{
+        CommandExecuted, CommandKind, InternalCommand, LapceWorkbenchCommand,
+    },
     debug::{RunDebugMode, RunDebugProcess},
     keypress::{KeyPressFocus, condition::Condition},
     window_tab::CommonData,
@@ -226,6 +228,27 @@ impl KeyPressFocus for TerminalData {
                 }
                 _ => return CommandExecuted::No,
             },
+            // Keys are sent to the shell when the focused terminal does not
+            // handle their command, so pane commands are handled here.
+            CommandKind::Workbench(cmd) => {
+                let term_id = self.term_id;
+                let internal = match cmd {
+                    LapceWorkbenchCommand::SplitTerminal => {
+                        InternalCommand::SplitTerminal { term_id }
+                    }
+                    LapceWorkbenchCommand::CloseTerminalPane => {
+                        InternalCommand::CloseTerminalPane { term_id }
+                    }
+                    LapceWorkbenchCommand::FocusNextTerminalPane => {
+                        InternalCommand::FocusNextTerminalPane { term_id }
+                    }
+                    LapceWorkbenchCommand::FocusPreviousTerminalPane => {
+                        InternalCommand::FocusPreviousTerminalPane { term_id }
+                    }
+                    _ => return CommandExecuted::No,
+                };
+                self.common.internal_command.send(internal);
+            }
             CommandKind::Focus(cmd) => match cmd {
                 FocusCommand::SplitVertical => {
                     self.common.internal_command.send(

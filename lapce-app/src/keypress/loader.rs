@@ -143,6 +143,34 @@ mod tests {
     use crate::keypress::keymap::KeyMapKey;
 
     #[test]
+    fn default_terminal_pane_keymaps() {
+        use crate::keypress::{
+            DEFAULT_KEYMAPS_COMMON, DEFAULT_KEYMAPS_MACOS, DEFAULT_KEYMAPS_NONMACOS,
+        };
+
+        for os_keymaps in [DEFAULT_KEYMAPS_MACOS, DEFAULT_KEYMAPS_NONMACOS] {
+            let mut loader = KeyMapLoader::new();
+            loader
+                .load_from_str(DEFAULT_KEYMAPS_COMMON, true)
+                .unwrap()
+                .load_from_str(os_keymaps, true)
+                .unwrap();
+            let (keymaps, commands) = loader.finalize();
+
+            for command in
+                ["focus_next_terminal_pane", "focus_previous_terminal_pane"]
+            {
+                let bindings = commands.get(command).unwrap();
+                assert_eq!(bindings.len(), 1, "{command}");
+                let binding = &bindings[0];
+                assert_eq!(binding.when.as_deref(), Some("terminal_focus"));
+                // The key is not bound to anything else.
+                assert_eq!(keymaps.get(&binding.key).unwrap().len(), 1, "{command}");
+            }
+        }
+    }
+
+    #[test]
     fn test_keymap() {
         let keymaps = r#"
 [[keymaps]]

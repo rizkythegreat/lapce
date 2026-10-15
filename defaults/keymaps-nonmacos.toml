@@ -308,3 +308,15 @@ command = "palette.workspace_symbol"
 [[keymaps]]
 key = "ctrl+g"
 command = "palette.line"
+
+# --------------------------------- Terminal split panes ---------------------------------
+
+[[keymaps]]
+key = "ctrl+alt+right"
+command = "focus_next_terminal_pane"
+when = "terminal_focus"
+
+[[keymaps]]
+key = "ctrl+alt+left"
+command = "focus_previous_terminal_pane"
+when = "terminal_focus"

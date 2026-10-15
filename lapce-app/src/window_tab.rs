@@ -1113,6 +1113,18 @@ impl WindowTabData {
                 self.terminal.close_active_pane();
                 self.update_focus_after_terminal_close();
             }
+            FocusNextTerminalPane => {
+                if let Some(term_id) = self.terminal.active_term_id() {
+                    self.terminal.focus_next_pane(term_id);
+                }
+                self.common.focus.set(Focus::Panel(PanelKind::Terminal));
+            }
+            FocusPreviousTerminalPane => {
+                if let Some(term_id) = self.terminal.active_term_id() {
+                    self.terminal.focus_previous_pane(term_id);
+                }
+                self.common.focus.set(Focus::Panel(PanelKind::Terminal));
+            }
             NextTerminalTab => {
                 self.terminal.next_tab();
                 if !self.panel.is_panel_visible(&PanelKind::Terminal) {
@@ -1938,6 +1950,12 @@ impl WindowTabData {
             InternalCommand::CloseTerminalPane { term_id } => {
                 self.terminal.close_pane(term_id);
                 self.update_focus_after_terminal_close();
+            }
+            InternalCommand::FocusNextTerminalPane { term_id } => {
+                self.terminal.focus_next_pane(term_id);
+            }
+            InternalCommand::FocusPreviousTerminalPane { term_id } => {
+                self.terminal.focus_previous_pane(term_id);
             }
             InternalCommand::RunAndDebug { mode, config } => {
                 self.run_and_debug(cx, &mode, &config);

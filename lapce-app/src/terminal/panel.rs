@@ -366,6 +366,39 @@ impl TerminalPanelData {
         }
     }
 
+    /// Focus the pane after `term_id` in its tab, wrapping around.
+    pub fn focus_next_pane(&self, term_id: TermId) {
+        self.cycle_pane_focus(term_id, true);
+    }
+
+    /// Focus the pane before `term_id` in its tab, wrapping around.
+    pub fn focus_previous_pane(&self, term_id: TermId) {
+        self.cycle_pane_focus(term_id, false);
+    }
+
+    fn cycle_pane_focus(&self, term_id: TermId, forward: bool) {
+        if let Some((_, tab, index, _)) = self.get_terminal_in_tab(&term_id) {
+            let len = tab.terminals.with_untracked(|t| t.len());
+            if len < 2 {
+                return;
+            }
+            let new_index = if forward {
+                (index + 1) % len
+            } else {
+                (index + len - 1) % len
+            };
+            tab.active.set(new_index);
+            self.update_debug_active_term();
+        }
+    }
+
+    /// The focused terminal of the active tab.
+    pub fn active_term_id(&self) -> Option<TermId> {
+        self.active_tab(false)
+            .and_then(|t| t.active_terminal(false))
+            .map(|t| t.term_id)
+    }
+
     /// Close the focused pane of the active tab.
     pub fn close_active_pane(&self) {
         if let Some(terminal) = self
