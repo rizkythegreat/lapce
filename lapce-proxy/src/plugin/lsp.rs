@@ -287,10 +287,10 @@ impl LspClient {
                             }
                         }
                     }
-                    Err(_err) => {
+                    Err(err) => {
                         core_rpc.log(
                             lapce_rpc::core::LogLevel::Error,
-                            format!("lsp server {server} stopped!"),
+                            format!("lsp server {server} connection closed: {err}"),
                             Some(format!(
                                 "lapce_proxy::plugin::lsp::{}::{}::stopped",
                                 volt_id_closure.author, volt_id_closure.name
@@ -546,17 +546,31 @@ pub fn read_message<T: BufRead>(reader: &mut T) -> Result<String> {
 
     loop {
         buffer.clear();
-        let _ = reader.read_line(&mut buffer)?;
-        // eprin
-        match &buffer {
-            s if s.trim().is_empty() => break,
-            s => {
-                match parse_header(s)? {
-                    LspHeader::ContentLength(len) => content_length = Some(len),
-                    LspHeader::ContentType => (),
-                };
+        if reader.read_line(&mut buffer)? == 0 {
+            return Err(anyhow!("language server closed stdout"));
+        }
+        if buffer.trim().is_empty() {
+            if content_length.is_some() {
+                break;
             }
-        };
+            continue;
+        }
+        match parse_header(&buffer) {
+            Ok(LspHeader::ContentLength(len)) => content_length = Some(len),
+            Ok(LspHeader::ContentType) => (),
+            Err(err) => {
+                if content_length.is_some() {
+                    return Err(err);
+                }
+                // Some servers or project dependencies print startup logs to
+                // stdout. Skip complete log lines between LSP frames without
+                // touching the length-delimited body of a valid message.
+                tracing::warn!(
+                    "Ignoring non-protocol language server output: {}",
+                    buffer.trim_end()
+                );
+            }
+        }
     }
 
     let content_length = content_length
@@ -567,6 +581,44 @@ pub fn read_message<T: BufRead>(reader: &mut T) -> Result<String> {
 
     let body = String::from_utf8(body_buffer)?;
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::read_message;
+
+    fn frame(body: &str) -> String {
+        format!("Content-Length: {}\r\n\r\n{body}", body.len())
+    }
+
+    #[test]
+    fn reads_frames_with_stdout_logs_between_them() {
+        let first = r#"{"jsonrpc":"2.0","id":0,"result":null}"#;
+        let second = r#"{"jsonrpc":"2.0","result":"✓ café","id":1}"#;
+        let mut reader = Cursor::new(format!(
+            "Listening for messages...\n\n{}Listening for messages...\n{}",
+            frame(first),
+            frame(second)
+        ));
+        assert_eq!(read_message(&mut reader).unwrap(), first);
+        assert_eq!(read_message(&mut reader).unwrap(), second);
+        assert!(read_message(&mut reader).is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_message_bodies() {
+        let mut reader = Cursor::new("Content-Length: 100\r\n\r\n{}");
+        assert!(read_message(&mut reader).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_headers_inside_a_frame() {
+        let mut reader =
+            Cursor::new("Content-Length: 2\r\ninvalid header\r\n\r\n{}");
+        assert!(read_message(&mut reader).is_err());
+    }
 }
 
 pub fn get_change_for_sync_kind(
