@@ -475,9 +475,7 @@ impl Doc {
     pub fn set_syntax(&self, syntax: Syntax) {
         batch(|| {
             self.syntax.set(syntax);
-            if self.semantic_styles.with_untracked(|s| s.is_none()) {
-                self.clear_style_cache();
-            }
+            self.clear_style_cache();
             self.clear_sticky_headers_cache();
         });
     }
@@ -885,32 +883,30 @@ impl Doc {
         self.sticky_headers.borrow_mut().clear();
     }
 
-    /// Get the active style information, either the semantic styles or the
-    /// tree-sitter syntax styles.
-    fn styles(&self) -> Option<Spans<Style>> {
-        if let Some(semantic_styles) = self.semantic_styles.get_untracked() {
-            Some(semantic_styles)
-        } else {
-            self.syntax.with_untracked(|syntax| syntax.styles.clone())
-        }
-    }
-
     /// Get the style information for the particular line from semantic/syntax highlighting.
     /// This caches the result if possible.
     pub fn line_style(&self, line: usize) -> Arc<Vec<LineStyle>> {
         if self.line_styles.borrow().get(&line).is_none() {
-            let styles = self.styles();
+            let text = self.buffer.with_untracked(|buffer| buffer.text().clone());
 
-            let line_styles = styles
-                .map(|styles| {
-                    let text =
-                        self.buffer.with_untracked(|buffer| buffer.text().clone());
-                    line_styles(&text, line, &styles)
+            // Semantic tokens usually only cover identifiers, so layer them over
+            // the tree-sitter styles instead of replacing them. Later spans win
+            // when the styles are applied to the text layout.
+            let mut styles = self
+                .syntax
+                .with_untracked(|syntax| {
+                    syntax
+                        .styles
+                        .as_ref()
+                        .map(|styles| line_styles(&text, line, styles))
                 })
                 .unwrap_or_default();
+            if let Some(semantic_styles) = self.semantic_styles.get_untracked() {
+                styles.extend(line_styles(&text, line, &semantic_styles));
+            }
             self.line_styles
                 .borrow_mut()
-                .insert(line, Arc::new(line_styles));
+                .insert(line, Arc::new(styles));
         }
         self.line_styles.borrow().get(&line).cloned().unwrap()
     }
