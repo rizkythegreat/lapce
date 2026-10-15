@@ -328,6 +328,7 @@ impl TerminalPanelData {
                 self.common.clone(),
             );
             let i = terminal_data.scope.create_rw_signal(0);
+            tab.split_pane_weight(term_id, terminal_data.term_id);
             tab.terminals.update(|terminals| {
                 terminals.insert(index + 1, (i, terminal_data));
             });
@@ -418,6 +419,7 @@ impl TerminalPanelData {
                     terminals.len()
                 })
                 .unwrap();
+            tab.remove_pane_weight(term_id);
             if len == 0 {
                 self.close_tab(Some(tab.terminal_tab_id));
             } else {

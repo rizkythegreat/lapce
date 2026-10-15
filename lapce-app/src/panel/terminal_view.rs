@@ -1,12 +1,14 @@
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use floem::{
     View, ViewId,
     action::show_context_menu,
     event::{Event, EventListener, EventPropagation},
-    kurbo::Size,
+    kurbo::{Point, Size},
     menu::{Menu, MenuItem},
-    reactive::{SignalGet, SignalUpdate, SignalWith, create_rw_signal},
+    reactive::{
+        ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith, create_rw_signal,
+    },
     style::CursorStyle,
     views::{
         Decorators, container, dyn_stack, empty, label,
@@ -20,11 +22,17 @@ use super::kind::PanelKind;
 use crate::{
     app::clickable_icon,
     command::{InternalCommand, LapceWorkbenchCommand},
-    config::{color::LapceColor, icon::LapceIcons},
+    config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     debug::RunDebugMode,
     listener::Listener,
     terminal::{
-        panel::TerminalPanelData, tab::TerminalTabData, view::terminal_view,
+        data::TerminalData,
+        panel::TerminalPanelData,
+        tab::{
+            DEFAULT_PANE_WEIGHT, MIN_PANE_WIDTH, TerminalTabData,
+            resize_pane_weights,
+        },
+        view::terminal_view,
     },
     window_tab::{Focus, WindowTabData},
 };
@@ -289,6 +297,10 @@ fn terminal_tab_split(
     let active = terminal_tab_data.active;
     let terminal_tab_scope = terminal_tab_data.scope;
     let terminals = terminal_tab_data.terminals;
+    let pane_weights = terminal_tab_data.pane_weights;
+    // Last laid-out width of each pane, used while dragging a divider.
+    let pane_widths: RwSignal<im::HashMap<TermId, f64>> =
+        create_rw_signal(im::HashMap::new());
     dyn_stack(
         move || {
             let terminals = terminal_tab_data.terminals.get();
@@ -321,50 +333,47 @@ fn terminal_tab_split(
                     .inset_right(4.0)
                     .apply_if(terminals.with(|t| t.len() <= 1), |s| s.hide())
             });
-            stack((
-                {
-                    let terminal_view = terminal_view(
-                        terminal.term_id,
-                        terminal.raw.read_only(),
-                        terminal.mode.read_only(),
-                        terminal.run_debug.read_only(),
-                        terminal_panel_data,
-                        terminal.launch_error,
-                        internal_command,
-                        workspace.clone(),
-                    );
-                    let view_id = terminal_view.id();
-                    let have_task = terminal.run_debug.get_untracked().is_some();
-                    terminal_view
-                        .on_event_cont(EventListener::PointerDown, move |_| {
-                            active.set(index.get_untracked());
-                        })
-                        .on_secondary_click_stop(move |_| {
-                            if have_task {
-                                tab_secondary_click(
-                                    internal_command,
-                                    view_id,
-                                    tab_index,
-                                    index.get_untracked(),
-                                    terminal.term_id,
-                                );
-                            }
-                        })
-                        .on_event(EventListener::PointerWheel, move |event| {
-                            if let Event::PointerWheel(pointer_event) = event {
-                                terminal.clone().wheel_scroll(pointer_event.delta.y);
-                                EventPropagation::Stop
-                            } else {
-                                EventPropagation::Continue
-                            }
-                        })
-                        .on_cleanup(move || {
-                            terminal_scope.dispose();
-                        })
-                        .style(|s| s.size_pct(100.0, 100.0))
-                },
-                close_pane,
-            ))
+            let content = container({
+                let terminal_view = terminal_view(
+                    terminal.term_id,
+                    terminal.raw.read_only(),
+                    terminal.mode.read_only(),
+                    terminal.run_debug.read_only(),
+                    terminal_panel_data,
+                    terminal.launch_error,
+                    internal_command,
+                    workspace.clone(),
+                );
+                let view_id = terminal_view.id();
+                let have_task = terminal.run_debug.get_untracked().is_some();
+                terminal_view
+                    .on_event_cont(EventListener::PointerDown, move |_| {
+                        active.set(index.get_untracked());
+                    })
+                    .on_secondary_click_stop(move |_| {
+                        if have_task {
+                            tab_secondary_click(
+                                internal_command,
+                                view_id,
+                                tab_index,
+                                index.get_untracked(),
+                                terminal.term_id,
+                            );
+                        }
+                    })
+                    .on_event(EventListener::PointerWheel, move |event| {
+                        if let Event::PointerWheel(pointer_event) = event {
+                            terminal.clone().wheel_scroll(pointer_event.delta.y);
+                            EventPropagation::Stop
+                        } else {
+                            EventPropagation::Continue
+                        }
+                    })
+                    .on_cleanup(move || {
+                        terminal_scope.dispose();
+                    })
+                    .style(|s| s.size_pct(100.0, 100.0))
+            })
             .style(move |s| {
                 s.size_pct(100.0, 100.0).padding_horiz(10.0).apply_if(
                     index.get() > 0,
@@ -374,13 +383,101 @@ fn terminal_tab_split(
                         )
                     },
                 )
+            });
+            stack((
+                content,
+                close_pane,
+                pane_divider(index, terminals, pane_weights, pane_widths, config),
+            ))
+            .on_resize(move |rect| {
+                let width = rect.width();
+                if pane_widths.with_untracked(|w| w.get(&term_id) != Some(&width)) {
+                    pane_widths.update(|w| {
+                        w.insert(term_id, width);
+                    });
+                }
+            })
+            .on_cleanup(move || {
+                pane_widths.update(|w| {
+                    w.remove(&term_id);
+                });
+            })
+            .style(move |s| {
+                let weight = pane_weights
+                    .with(|w| w.get(&term_id).copied())
+                    .unwrap_or(DEFAULT_PANE_WEIGHT);
+                s.flex_basis(0.0)
+                    .flex_grow(weight as f32)
+                    .min_width(0.0)
+                    .height_pct(100.0)
             })
         },
     )
     .on_cleanup(move || {
         terminal_tab_scope.dispose();
     })
-    .style(|s| s.size_pct(100.0, 100.0))
+    .style(|s| s.flex_row().size_pct(100.0, 100.0))
+}
+
+/// Draggable divider on the left edge of the pane at `index` (hidden for the
+/// first pane). Dragging only changes flex weights: the panes are re-laid
+/// out and each terminal view resizes its PTY, so no shell is restarted.
+fn pane_divider(
+    index: RwSignal<usize>,
+    terminals: RwSignal<im::Vector<(RwSignal<usize>, TerminalData)>>,
+    pane_weights: RwSignal<im::HashMap<TermId, f64>>,
+    pane_widths: RwSignal<im::HashMap<TermId, f64>>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let drag_start: RwSignal<Option<Point>> = create_rw_signal(None);
+    let view = empty();
+    let view_id = view.id();
+    view.on_event_stop(EventListener::PointerDown, move |event| {
+        if let Event::PointerDown(pointer_event) = event {
+            view_id.request_active();
+            drag_start.set(Some(pointer_event.pos));
+        }
+    })
+    .on_event_stop(EventListener::PointerUp, move |_| {
+        drag_start.set(None);
+    })
+    .on_event_stop(EventListener::PointerMove, move |event| {
+        let Event::PointerMove(pointer_event) = event else {
+            return;
+        };
+        let Some(start) = drag_start.get_untracked() else {
+            return;
+        };
+        let order: Vec<TermId> =
+            terminals.with_untracked(|t| t.iter().map(|(_, t)| t.term_id).collect());
+        let widths: Vec<f64> = pane_widths.with_untracked(|w| {
+            order
+                .iter()
+                .map(|id| w.get(id).copied().unwrap_or(0.0))
+                .collect()
+        });
+        if let Some(weights) = resize_pane_weights(
+            &widths,
+            index.get_untracked(),
+            pointer_event.pos.x - start.x,
+            MIN_PANE_WIDTH,
+        ) {
+            pane_weights.set(order.into_iter().zip(weights).collect());
+        }
+    })
+    .style(move |s| {
+        let is_dragging = drag_start.get().is_some();
+        let caret = config.get().color(LapceColor::EDITOR_CARET);
+        s.absolute()
+            .inset_left(0.0)
+            .width(5.0)
+            .height_pct(100.0)
+            .apply_if(index.get() == 0, |s| s.hide())
+            .hover(|s| s.cursor(CursorStyle::ColResize).background(caret))
+            .apply_if(is_dragging, |s| {
+                s.cursor(CursorStyle::ColResize).background(caret)
+            })
+    })
 }
 
 fn terminal_tab_content(window_tab_data: Rc<WindowTabData>) -> impl View {
