@@ -52,6 +52,10 @@ pub struct CompletionData {
     pub input: String,
     /// `(Input, CompletionItems)`
     pub input_items: im::HashMap<String, im::Vector<ScoredCompletionItem>>,
+    /// Whether every response received for an input was a complete list.
+    /// Complete lists are filtered locally as the input grows, instead of
+    /// asking the language servers again on every keystroke.
+    pub complete_inputs: im::HashMap<String, bool>,
     /// The filtered items that are being displayed to the user
     pub filtered_items: im::Vector<ScoredCompletionItem>,
     /// The size of the completion element.  
@@ -78,6 +82,7 @@ impl CompletionData {
             active,
             input: "".to_string(),
             input_items: im::HashMap::new(),
+            complete_inputs: im::HashMap::new(),
             filtered_items: im::Vector::new(),
             layout_rect: Rect::ZERO,
             matcher: cx
@@ -101,11 +106,14 @@ impl CompletionData {
             return;
         }
 
-        let items = match resp {
-            CompletionResponse::Array(items) => items,
-            // TODO: Possibly handle the 'is_incomplete' field on List.
-            CompletionResponse::List(list) => &list.items,
+        let (items, complete) = match resp {
+            CompletionResponse::Array(items) => (items, true),
+            CompletionResponse::List(list) => (&list.items, !list.is_incomplete),
         };
+        self.complete_inputs
+            .entry(input.to_string())
+            .and_modify(|c| *c &= complete)
+            .or_insert(complete);
         let items: im::Vector<ScoredCompletionItem> = items
             .iter()
             .map(|i| ScoredCompletionItem {
@@ -124,6 +132,12 @@ impl CompletionData {
             .or_default()
             .append(items);
         self.filter_items();
+    }
+
+    /// Whether a complete list of items has been received for `input`, so
+    /// longer inputs can be filtered from it without a new request.
+    pub fn is_complete(&self, input: &str) -> bool {
+        self.complete_inputs.get(input).copied().unwrap_or(false)
     }
 
     /// Request for completion items wit the current request id.
@@ -151,6 +165,7 @@ impl CompletionData {
         self.active.set(0);
         self.input.clear();
         self.input_items.clear();
+        self.complete_inputs.clear();
         self.filtered_items.clear();
     }
 

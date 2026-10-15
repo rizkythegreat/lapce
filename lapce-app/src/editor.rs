@@ -1845,7 +1845,9 @@ impl EditorData {
                     );
                 }
 
-                if !completion.input_items.contains_key(&input) {
+                if !completion.input_items.contains_key(&input)
+                    && !completion.is_complete("")
+                {
                     let position = doc
                         .buffer
                         .with_untracked(|buffer| buffer.offset_to_position(offset));
@@ -1874,6 +1876,7 @@ impl EditorData {
             completion.input.clone_from(&input);
             completion.status = CompletionStatus::Started;
             completion.input_items.clear();
+            completion.complete_inputs.clear();
             completion.request_id += 1;
             let start_pos = doc
                 .buffer
