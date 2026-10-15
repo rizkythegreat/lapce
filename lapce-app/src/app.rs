@@ -4131,7 +4131,10 @@ pub fn load_shell_env() {
     let mut command = Command::new(shell);
 
     #[cfg(not(windows))]
-    command.args(["--login", "-c", "printenv"]);
+    // Node version managers such as NVM are commonly initialized in .zshrc
+    // or .bashrc, which login shells only read in interactive mode. GUI
+    // launches need that PATH too so language servers can find Node.js.
+    command.args(["--login", "--interactive", "-c", "printenv"]);
 
     #[cfg(windows)]
     command.args([
