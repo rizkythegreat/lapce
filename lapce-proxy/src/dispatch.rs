@@ -218,6 +218,11 @@ impl ProxyHandler for Dispatcher {
                     tx.send(Msg::Input(content.into_bytes().into()));
                 }
             }
+            TerminalWriteBytes { term_id, content } => {
+                if let Some(tx) = self.terminals.get(&term_id) {
+                    tx.send(Msg::Input(content.into()));
+                }
+            }
             TerminalResize {
                 term_id,
                 width,

@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use alacritty_terminal::{
     Term,
@@ -27,6 +32,7 @@ use parking_lot::RwLock;
 use url::Url;
 
 use super::{
+    dropped_file::quote_dropped_path,
     event::TermEvent,
     raw::{EventProxy, RawTerminal},
 };
@@ -336,6 +342,36 @@ impl KeyPressFocus for TerminalData {
 }
 
 impl TerminalData {
+    pub fn paste_file_path(&self, path: &Path) -> Result<(), &'static str> {
+        if !self.workspace.kind.is_local() {
+            return Err(
+                "Dropping local files into SSH/WSL terminals requires a file \
+                 transfer, which is not supported yet.",
+            );
+        }
+        let shell = self.profile.as_ref().and_then(|p| p.command.as_deref());
+        let default_shell = std::env::var("SHELL").ok();
+        let text = quote_dropped_path(path, shell.or(default_shell.as_deref()))?;
+        let raw = self.raw.get_untracked();
+        let mut raw = raw.write();
+        let term = &mut raw.term;
+        if term.mode().contains(TermMode::VI) {
+            term.toggle_vi_mode();
+        }
+        term.selection = None;
+        term.scroll_display(Scroll::Bottom);
+        let content = if term.mode().contains(TermMode::BRACKETED_PASTE) {
+            format!("\x1b[200~{text}\x1b[201~")
+        } else {
+            text
+        };
+        drop(raw);
+        self.mode.set(Mode::Terminal);
+        self.common.proxy.terminal_write(self.term_id, content);
+        self.common.view_id.get_untracked().request_paint();
+        Ok(())
+    }
+
     pub fn new(
         cx: Scope,
         workspace: Arc<LapceWorkspace>,
@@ -660,20 +696,6 @@ impl TerminalData {
                 term_sequence!([all], key, "\x1b[6~", "\x1b[6;", "~")
             }
             _ => None,
-        }
-    }
-
-    pub fn wheel_scroll(&self, delta: f64) {
-        let config = self.common.config.get_untracked();
-        let step = config.terminal_line_height() as f64;
-        let raw = self.raw.get_untracked();
-        let mut raw = raw.write();
-        raw.scroll_delta -= delta;
-        let delta = (raw.scroll_delta / step) as i32;
-        raw.scroll_delta -= delta as f64 * step;
-        if delta != 0 {
-            let scroll = alacritty_terminal::grid::Scroll::Delta(delta);
-            raw.term.scroll_display(scroll);
         }
     }
 

@@ -310,6 +310,10 @@ pub enum ProxyNotification {
         term_id: TermId,
         content: String,
     },
+    TerminalWriteBytes {
+        term_id: TermId,
+        content: Vec<u8>,
+    },
     TerminalResize {
         term_id: TermId,
         width: usize,
@@ -716,6 +720,10 @@ impl ProxyRpcHandler {
 
     pub fn terminal_write(&self, term_id: TermId, content: String) {
         self.notification(ProxyNotification::TerminalWrite { term_id, content });
+    }
+
+    pub fn terminal_write_bytes(&self, term_id: TermId, content: Vec<u8>) {
+        self.notification(ProxyNotification::TerminalWriteBytes { term_id, content });
     }
 
     pub fn new_buffer(

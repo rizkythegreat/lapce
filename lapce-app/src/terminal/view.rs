@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::SystemTime};
 
 use alacritty_terminal::{
-    grid::Dimensions,
+    grid::{Dimensions, Scroll},
     index::Side,
     selection::{Selection, SelectionType},
     term::{RenderableContent, cell::Flags, test::TermSize},
@@ -28,7 +28,7 @@ use parking_lot::RwLock;
 use regex::Regex;
 use unicode_width::UnicodeWidthChar;
 
-use super::{panel::TerminalPanelData, raw::RawTerminal};
+use super::{panel::TerminalPanelData, raw::RawTerminal, scroll::scroll_input};
 use crate::{
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor},
@@ -505,6 +505,38 @@ impl View for TerminalView {
         event: &Event,
     ) -> EventPropagation {
         match event {
+            Event::PointerWheel(e) => {
+                let line_height =
+                    self.config.get_untracked().terminal_line_height() as f64;
+                let char_width = self.char_size().width;
+                let mut raw = self.raw.write();
+                raw.scroll_delta -= e.delta.y;
+                let lines = (raw.scroll_delta / line_height) as i32;
+                raw.scroll_delta -= lines as f64 * line_height;
+                if lines != 0 {
+                    // Mouse reports use screen coordinates, independent of scrollback.
+                    let column = ((e.pos.x / char_width).max(0.0) as usize)
+                        .min(raw.term.columns().saturating_sub(1));
+                    let row = ((e.pos.y / line_height).max(0.0) as usize)
+                        .min(raw.term.screen_lines().saturating_sub(1));
+                    let mut mode = *raw.term.mode();
+                    if self.mode.get_untracked() != Mode::Terminal {
+                        mode.insert(alacritty_terminal::term::TermMode::VI);
+                    }
+                    if let Some(content) =
+                        scroll_input(mode, e.modifiers, lines, column, row)
+                    {
+                        drop(raw);
+                        if !content.is_empty() {
+                            self.proxy.terminal_write_bytes(self.term_id, content);
+                        }
+                    } else {
+                        raw.term.scroll_display(Scroll::Delta(lines));
+                    }
+                    _cx.app_state_mut().request_paint(self.id);
+                }
+                return EventPropagation::Stop;
+            }
             Event::PointerDown(e) => {
                 self.update_mouse_action_by_down(e);
             }

@@ -334,6 +334,8 @@ fn terminal_tab_split(
                     .apply_if(terminals.with(|t| t.len() <= 1), |s| s.hide())
             });
             let content = container({
+                let drop_panel = terminal_panel_data.clone();
+                let drop_terminal = terminal.clone();
                 let terminal_view = terminal_view(
                     terminal.term_id,
                     terminal.raw.read_only(),
@@ -347,6 +349,28 @@ fn terminal_tab_split(
                 let view_id = terminal_view.id();
                 let have_task = terminal.run_debug.get_untracked().is_some();
                 terminal_view
+                    .on_event(EventListener::DroppedFile, move |event| {
+                        let Event::DroppedFile(file) = event else {
+                            return EventPropagation::Continue;
+                        };
+                        if !file.path.is_file() {
+                            return EventPropagation::Continue;
+                        }
+                        match drop_terminal.paste_file_path(&file.path) {
+                            Ok(()) => {
+                                drop_panel.focus_terminal(drop_terminal.term_id);
+                                view_id.request_focus();
+                            }
+                            Err(message) => {
+                                internal_command.send(InternalCommand::ShowAlert {
+                                    title: "Cannot drop file into terminal".into(),
+                                    msg: message.into(),
+                                    buttons: Vec::new(),
+                                });
+                            }
+                        }
+                        EventPropagation::Stop
+                    })
                     .on_event_cont(EventListener::PointerDown, move |_| {
                         active.set(index.get_untracked());
                     })
@@ -359,14 +383,6 @@ fn terminal_tab_split(
                                 index.get_untracked(),
                                 terminal.term_id,
                             );
-                        }
-                    })
-                    .on_event(EventListener::PointerWheel, move |event| {
-                        if let Event::PointerWheel(pointer_event) = event {
-                            terminal.clone().wheel_scroll(pointer_event.delta.y);
-                            EventPropagation::Stop
-                        } else {
-                            EventPropagation::Continue
                         }
                     })
                     .on_cleanup(move || {
