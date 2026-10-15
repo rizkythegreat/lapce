@@ -88,26 +88,51 @@ impl TerminalTabData {
         }
     }
 
-    /// Give a newly split pane half of the space of the pane it was split from.
+    /// Give a newly split pane half of the space of the pane it was split
+    /// from. Call after `new` has been added to `terminals`.
     pub fn split_pane_weight(&self, source: TermId, new: TermId) {
         let half = self.pane_weight(&source, false) / 2.0;
-        self.pane_weights.update(|w| {
-            w.insert(source, half);
-            w.insert(new, half);
+        self.set_normalized_pane_weights(|id, weight| {
+            if *id == source || *id == new {
+                half
+            } else {
+                weight
+            }
         });
     }
 
-    /// Forget the weight of a closed pane; the others share its space.
-    pub fn remove_pane_weight(&self, term_id: &TermId) {
-        if self
-            .pane_weights
-            .with_untracked(|w| w.contains_key(term_id))
-        {
-            self.pane_weights.update(|w| {
-                w.remove(term_id);
-            });
-        }
+    /// Recompute weights after a pane was removed from `terminals`, so the
+    /// remaining panes share its space and still fill the whole tab.
+    pub fn remove_pane_weight(&self) {
+        self.set_normalized_pane_weights(|_, weight| weight);
     }
+
+    /// Store weights for exactly the current panes, normalised to an average
+    /// of [`DEFAULT_PANE_WEIGHT`]. Flex grow factors that sum to less than 1
+    /// would leave part of the tab empty.
+    fn set_normalized_pane_weights(&self, weight: impl Fn(&TermId, f64) -> f64) {
+        let ids: Vec<TermId> = self
+            .terminals
+            .with_untracked(|t| t.iter().map(|(_, t)| t.term_id).collect());
+        let weights: Vec<f64> = ids
+            .iter()
+            .map(|id| weight(id, self.pane_weight(id, false)))
+            .collect();
+        let weights = normalize_pane_weights(&weights);
+        self.pane_weights
+            .set(ids.into_iter().zip(weights).collect());
+    }
+}
+
+/// Scale `weights` so their average is [`DEFAULT_PANE_WEIGHT`]. Invalid input
+/// (empty, non-finite or non-positive total) yields equal weights.
+pub fn normalize_pane_weights(weights: &[f64]) -> Vec<f64> {
+    let total: f64 = weights.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return vec![DEFAULT_PANE_WEIGHT; weights.len()];
+    }
+    let scale = DEFAULT_PANE_WEIGHT * weights.len() as f64 / total;
+    weights.iter().map(|w| w * scale).collect()
 }
 
 /// Compute pane widths after dragging the divider on the left edge of pane
@@ -142,8 +167,7 @@ pub fn resize_pane_weights(
     if !total.is_finite() || total <= 0.0 {
         return None;
     }
-    let scale = DEFAULT_PANE_WEIGHT * new.len() as f64 / total;
-    Some(new.into_iter().map(|w| w * scale).collect())
+    Some(normalize_pane_weights(&new))
 }
 
 #[cfg(test)]
@@ -176,6 +200,18 @@ mod tests {
         // Already at the minimum and pushed further.
         assert!(resize_pane_weights(&[10.0, 100.0], 1, -5.0, 10.0).is_none());
         assert!(resize_pane_weights(&[0.0, 0.0], 1, 5.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn normalize_keeps_ratios_and_fills_space() {
+        // A lone pane left over from a split must grow back to full width.
+        assert!(approx(&normalize_pane_weights(&[0.5]), &[1.0]));
+        // Split of the first of two equal panes: 0.5, 0.5, 1.0.
+        let w = normalize_pane_weights(&[0.5, 0.5, 1.0]);
+        assert!(approx(&w, &[0.75, 0.75, 1.5]));
+        assert!((w.iter().sum::<f64>() - 3.0).abs() < 1e-9);
+        assert!(approx(&normalize_pane_weights(&[0.0, 0.0]), &[1.0, 1.0]));
+        assert!(normalize_pane_weights(&[]).is_empty());
     }
 
     #[test]
