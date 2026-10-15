@@ -1039,6 +1039,9 @@ impl EditorData {
             FocusCommand::ShowCodeActions => {
                 self.show_code_actions(false);
             }
+            FocusCommand::GetCompletion => {
+                self.update_completion(true);
+            }
             FocusCommand::SearchWholeWordForward => {
                 self.search_whole_word_forward(mods);
             }
