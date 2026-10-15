@@ -7,10 +7,12 @@
 - (Un)confirmed state of the editor is properly (re)stored
 - Implemented Folder/File choosing in remotes
 - The file explorer can now be focused with the mouse, and has keybinds for renaming/deleting files
+- Split terminals: a Split Terminal button and command, a close button per pane, draggable dividers to resize panes, and keyboard navigation between panes (`focus_next_terminal_pane` / `focus_previous_terminal_pane`, Alt+Cmd+Right/Left on macOS, Ctrl+Alt+Right/Left elsewhere). `split_close` (Cmd+W / Ctrl+F4) closes the focused pane. A split reuses the profile of the terminal it was split from
 
 ### Bug Fixes
 
 - Fix crash on Save All after closing settings (<https://github.com/lapce/lapce/issues/3867>)
+- Fix shells left running after closing a terminal tab with the `close_terminal_tab` command
 
 ## 0.4.6
 
