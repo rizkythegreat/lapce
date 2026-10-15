@@ -8,6 +8,10 @@ custom-titlebar = true
 file-explorer-double-click = false
 auto-reload-plugin = false
 
+[tailwindcss]
+enabled = true
+server-path = ""
+
 [editor]
 font-family = "monospace"
 font-size = 13

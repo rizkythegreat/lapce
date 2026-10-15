@@ -45,6 +45,7 @@ pub struct PluginCatalog {
     plugin_configurations: HashMap<String, HashMap<String, serde_json::Value>>,
     unactivated_volts: HashMap<VoltID, VoltMetadata>,
     open_files: HashMap<PathBuf, String>,
+    tailwind_started: bool,
 }
 
 impl PluginCatalog {
@@ -64,6 +65,7 @@ impl PluginCatalog {
             debuggers: HashMap::new(),
             unactivated_volts: HashMap::new(),
             open_files: HashMap::new(),
+            tailwind_started: false,
         };
 
         thread::spawn(move || {
@@ -283,6 +285,34 @@ impl PluginCatalog {
     }
 
     pub fn handle_did_open_text_document(&mut self, document: TextDocumentItem) {
+        if !self.tailwind_started
+            && self.workspace.is_some()
+            && super::tailwind::supports_language(&document.language_id)
+            && super::tailwind::enabled(
+                self.plugin_configurations.get("tailwindcss"),
+            )
+        {
+            self.tailwind_started = true;
+            let workspace = self.workspace.clone().unwrap();
+            let config = self.plugin_configurations.get("tailwindcss").cloned();
+            let plugin_rpc = self.plugin_rpc.clone();
+            thread::spawn(move || {
+                if let Err(err) = super::tailwind::start(
+                    workspace,
+                    config.as_ref(),
+                    plugin_rpc.clone(),
+                ) {
+                    plugin_rpc.core_rpc.log(
+                        lapce_rpc::core::LogLevel::Warn,
+                        format!(
+                            "Tailwind CSS: {err}. Install with `npm install -g @tailwindcss/language-server`, or set tailwindcss.server-path, then reload the workspace."
+                        ),
+                        None,
+                    );
+                }
+            });
+        }
+
         match document.uri.to_file_path() {
             Ok(path) => {
                 self.open_files.insert(path, document.language_id.clone());

@@ -106,6 +106,34 @@ impl PluginServerHandler for LspClient {
         params: Params,
         resp: ResponseSender,
     ) {
+        if super::tailwind::is_builtin(&self.server_rpc.volt_id)
+            && method == request::WorkspaceConfiguration::METHOD
+        {
+            let result = serde_json::to_value(params)
+                .and_then(serde_json::from_value::<ConfigurationParams>);
+            match result {
+                Ok(params) => {
+                    let settings = self
+                        .options
+                        .as_ref()
+                        .and_then(|options| options.get("settings"))
+                        .unwrap_or(&Value::Null);
+                    let values: Vec<Value> = params
+                        .items
+                        .iter()
+                        .map(|item| {
+                            super::tailwind::configuration(
+                                settings,
+                                item.section.as_deref(),
+                            )
+                        })
+                        .collect();
+                    resp.send(values);
+                }
+                Err(err) => resp.send_err(-32602, err.to_string()),
+            }
+            return;
+        }
         self.host.handle_request(id, method, params, resp);
     }
 
@@ -364,12 +392,18 @@ impl LspClient {
             .clone()
             .map(|p| Url::from_directory_path(p).unwrap());
         tracing::debug!("initialization_options {:?}", self.options);
+        let mut capabilities = client_capabilities();
+        if super::tailwind::is_builtin(&self.server_rpc.volt_id) {
+            if let Some(workspace) = capabilities.workspace.as_mut() {
+                workspace.configuration = Some(true);
+            }
+        }
         #[allow(deprecated)]
         let params = InitializeParams {
             process_id: Some(process::id()),
             root_uri: root_uri.clone(),
             initialization_options: self.options.clone(),
-            capabilities: client_capabilities(),
+            capabilities,
             trace: Some(TraceValue::Verbose),
             workspace_folders: root_uri.map(|uri| {
                 vec![WorkspaceFolder {

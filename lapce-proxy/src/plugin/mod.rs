@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod dap;
 pub mod lsp;
 pub mod psp;
+mod tailwind;
 pub mod wasi;
 
 use std::{
