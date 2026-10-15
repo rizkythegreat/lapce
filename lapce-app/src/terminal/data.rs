@@ -49,6 +49,8 @@ pub struct TerminalData {
     pub visual_mode: RwSignal<VisualMode>,
     pub raw: RwSignal<Arc<RwLock<RawTerminal>>>,
     pub run_debug: RwSignal<Option<RunDebugProcess>>,
+    /// The profile this terminal was launched with, so splits can reuse it.
+    pub profile: Option<TerminalProfile>,
     pub common: Rc<CommonData>,
 }
 
@@ -335,7 +337,7 @@ impl TerminalData {
             &workspace,
             term_id,
             run_debug.as_ref(),
-            profile,
+            profile.clone(),
             common.clone(),
             launch_error,
         );
@@ -352,6 +354,7 @@ impl TerminalData {
             raw,
             title,
             run_debug,
+            profile,
             mode,
             visual_mode,
             common,

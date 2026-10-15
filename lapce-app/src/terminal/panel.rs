@@ -307,18 +307,71 @@ impl TerminalPanelData {
         })
     }
 
+    /// Split the terminal `term_id`, starting a new independent shell in a pane
+    /// to its right and focusing it.
+    ///
+    /// The new shell reuses the source terminal's profile, falling back to the
+    /// configured default profile. Run/debug configurations are not copied.
     pub fn split(&self, term_id: TermId) {
-        if let Some((_, tab, index, _)) = self.get_terminal_in_tab(&term_id) {
+        if let Some((_, tab, index, terminal)) = self.get_terminal_in_tab(&term_id) {
+            let profile = terminal.profile.clone().or_else(|| {
+                self.common
+                    .config
+                    .get_untracked()
+                    .terminal
+                    .get_default_profile()
+            });
             let terminal_data = TerminalData::new(
                 tab.scope,
                 self.workspace.clone(),
-                None,
+                profile,
                 self.common.clone(),
             );
             let i = terminal_data.scope.create_rw_signal(0);
             tab.terminals.update(|terminals| {
                 terminals.insert(index + 1, (i, terminal_data));
             });
+            tab.active.set(index + 1);
+            self.update_debug_active_term();
+        }
+    }
+
+    /// Split the focused terminal of the active tab, creating a tab first if
+    /// there is none.
+    pub fn split_active(&self) {
+        let terminal = self
+            .active_tab(false)
+            .and_then(|t| t.active_terminal(false));
+        match terminal {
+            Some(terminal) => self.split(terminal.term_id),
+            None => self.new_tab(
+                self.common
+                    .config
+                    .get_untracked()
+                    .terminal
+                    .get_default_profile(),
+            ),
+        }
+    }
+
+    /// Close a single pane and stop its shell. Closing the last pane of a tab
+    /// closes the tab, as when its shell exits.
+    pub fn close_pane(&self, term_id: TermId) {
+        if let Some(terminal) = self.get_terminal(&term_id) {
+            // Remove the pane first so the `terminal_process_stopped`
+            // notification triggered by `stop` finds nothing left to do.
+            self.close_terminal(&term_id);
+            terminal.stop();
+        }
+    }
+
+    /// Close the focused pane of the active tab.
+    pub fn close_active_pane(&self) {
+        if let Some(terminal) = self
+            .active_tab(false)
+            .and_then(|t| t.active_terminal(false))
+        {
+            self.close_pane(terminal.term_id);
         }
     }
 
