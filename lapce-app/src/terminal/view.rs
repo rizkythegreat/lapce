@@ -63,6 +63,8 @@ pub struct TerminalView {
     raw: Arc<RwLock<RawTerminal>>,
     mode: ReadSignal<Mode>,
     size: Size,
+    /// Grid size (columns, lines) last sent to the PTY.
+    term_size: (usize, usize),
     is_focused: bool,
     config: ReadSignal<Arc<LapceConfig>>,
     run_config: ReadSignal<Option<RunDebugProcess>>,
@@ -137,6 +139,7 @@ pub fn terminal_view(
         proxy,
         run_config,
         size: Size::ZERO,
+        term_size: (0, 0),
         is_focused: false,
         launch_error,
         internal_command,
@@ -618,9 +621,14 @@ impl View for TerminalView {
         if size != self.size {
             self.size = size;
             let (width, height) = self.terminal_size();
-            let term_size = TermSize::new(width, height);
-            self.raw.write().term.resize(term_size);
-            self.proxy.terminal_resize(self.term_id, width, height);
+            // Pixel-level changes (e.g. dragging a split divider) only need
+            // a PTY resize when the grid size actually changes.
+            if (width, height) != self.term_size {
+                self.term_size = (width, height);
+                let term_size = TermSize::new(width, height);
+                self.raw.write().term.resize(term_size);
+                self.proxy.terminal_resize(self.term_id, width, height);
+            }
         }
 
         None
