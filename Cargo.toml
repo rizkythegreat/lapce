@@ -78,14 +78,15 @@ lapce-proxy = { path = "./lapce-proxy" }
 
 [workspace.dependencies.floem]
 # path = "../floem"
-git = "https://github.com/lapce/floem"
-rev = "31fa8f444c37f4c314f47d88c23ffdbc25f2ab53"
+# Fork of lapce/floem with the macOS window menu (branch macos-window-menu)
+git = "https://github.com/rizkythegreat/floem"
+rev = "be4767e1064d205d7245d6a5a0994f8ddffca085"
 features = ["editor", "serde", "default-image-formats", "rfd-async-std"]
 
 [workspace.dependencies.floem-editor-core]
 # path = "../floem/editor-core/"
-git = "https://github.com/lapce/floem"
-rev = "31fa8f444c37f4c314f47d88c23ffdbc25f2ab53"
+git = "https://github.com/rizkythegreat/floem"
+rev = "be4767e1064d205d7245d6a5a0994f8ddffca085"
 features = ["serde"]
 
 [patch.crates-io]
