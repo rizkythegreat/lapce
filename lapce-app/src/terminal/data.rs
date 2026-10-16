@@ -661,7 +661,15 @@ impl TerminalData {
             }
 
             Key::Named(NamedKey::Tab) => Some("\x09"),
-            Key::Named(NamedKey::Enter) => Some("\r"),
+            Key::Named(NamedKey::Enter) => {
+                // Shift+Enter has no standard sequence; send ESC CR like
+                // Alt+Enter, which TUIs such as Claude Code read as a newline.
+                Some(if key.modifiers.shift() || key.modifiers.alt() {
+                    "\x1b\r"
+                } else {
+                    "\r"
+                })
+            }
             Key::Named(NamedKey::Escape) => Some("\x1b"),
 
             // The following either expands to `\x1b[X` or `\x1b[1;NX` where N is a modifier value
