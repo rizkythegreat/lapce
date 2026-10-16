@@ -4356,6 +4356,104 @@ pub fn window_menu(
                 });
             })),
     )
+    .entry(
+        Menu::new("View")
+            .entry(MenuItem::new("Command Palette").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::PaletteCommand);
+            }))
+            .separator()
+            .entry(MenuItem::new("File Explorer").action(move || {
+                workbench_command
+                    .send(LapceWorkbenchCommand::ToggleFileExplorerVisual);
+            }))
+            .entry(MenuItem::new("Search").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ToggleSearchVisual);
+            }))
+            .entry(MenuItem::new("Problems").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ToggleProblemVisual);
+            }))
+            .entry(MenuItem::new("Terminal").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ToggleTerminalVisual);
+            }))
+            .separator()
+            .entry(MenuItem::new("Toggle Left Panel").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::TogglePanelLeftVisual);
+            }))
+            .entry(MenuItem::new("Toggle Right Panel").action(move || {
+                workbench_command
+                    .send(LapceWorkbenchCommand::TogglePanelRightVisual);
+            }))
+            .entry(MenuItem::new("Toggle Bottom Panel").action(move || {
+                workbench_command
+                    .send(LapceWorkbenchCommand::TogglePanelBottomVisual);
+            }))
+            .separator()
+            .entry(MenuItem::new("Split Right").action(move || {
+                lapce_command.send(LapceCommand {
+                    kind: CommandKind::Focus(FocusCommand::SplitVertical),
+                    data: None,
+                });
+            }))
+            .entry(MenuItem::new("Split Down").action(move || {
+                lapce_command.send(LapceCommand {
+                    kind: CommandKind::Focus(FocusCommand::SplitHorizontal),
+                    data: None,
+                });
+            }))
+            .separator()
+            .entry(MenuItem::new("Zoom In").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ZoomIn);
+            }))
+            .entry(MenuItem::new("Zoom Out").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ZoomOut);
+            }))
+            .entry(MenuItem::new("Reset Zoom").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ZoomReset);
+            })),
+    )
+    .entry(
+        Menu::new("Window")
+            .entry(MenuItem::new("Minimize").action(move || {
+                floem::action::minimize_window();
+            }))
+            .separator()
+            .entry(MenuItem::new("New Window").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::NewWindow);
+            }))
+            .entry(MenuItem::new("New Window Tab").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::NewWindowTab);
+            }))
+            .entry(MenuItem::new("Next Window Tab").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::NextWindowTab);
+            }))
+            .entry(MenuItem::new("Previous Window Tab").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::PreviousWindowTab);
+            }))
+            .separator()
+            .entry(MenuItem::new("Reload Window").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::ReloadWindow);
+            })),
+    )
+    .entry(
+        Menu::new("Help")
+            .entry(MenuItem::new("Lapce Website").action(move || {
+                if let Err(err) = open::that("https://lapce.dev") {
+                    tracing::error!("Failed to open Lapce website: {err}");
+                }
+            }))
+            .entry(MenuItem::new("Lapce on GitHub").action(move || {
+                if let Err(err) = open::that("https://github.com/lapce/lapce") {
+                    tracing::error!("Failed to open Lapce on GitHub: {err}");
+                }
+            }))
+            .separator()
+            .entry(MenuItem::new("Open Log File").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::OpenLogFile);
+            }))
+            .entry(MenuItem::new("Open Logs Directory").action(move || {
+                workbench_command.send(LapceWorkbenchCommand::OpenLogsDirectory);
+            })),
+    )
 }
 fn tab_secondary_click(
     internal_command: Listener<InternalCommand>,
