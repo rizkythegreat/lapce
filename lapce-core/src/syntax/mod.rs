@@ -949,21 +949,25 @@ impl Syntax {
         }
     }
 
+    /// Returns `false` when parsing failed or was cancelled. The layers are then
+    /// only partially updated, so `rev` is left as is to force a full parse next
+    /// time, and the result must not be used.
     pub fn parse(
         &mut self,
         new_rev: u64,
         new_text: Rope,
         edits: Option<&[SyntaxEdit]>,
-    ) {
+    ) -> bool {
         let layers = match &mut self.layers {
             Some(layers) => layers,
-            None => return,
+            None => return true,
         };
         let edits = edits.filter(|edits| new_rev == self.rev + edits.len() as u64);
         if let Err(err) =
             layers.update(self.rev, new_rev, &new_text, edits, &self.cancel_flag)
         {
             tracing::error!("{:?}", err);
+            return false;
         }
         let tree = layers.try_tree();
 
@@ -1026,7 +1030,8 @@ impl Syntax {
         self.lens = lens;
         self.normal_lines = normal_lines;
         self.styles = styles;
-        self.text = new_text
+        self.text = new_text;
+        true
     }
 
     pub fn update_lens_height(&mut self, line_height: usize, lens_height: usize) {

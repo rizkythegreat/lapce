@@ -851,8 +851,14 @@ impl Doc {
         });
         let mut syntax = self.syntax.get_untracked();
         rayon::spawn(move || {
-            syntax.parse(rev, text, edits.as_deref());
-            send(syntax);
+            // A panic escaping a rayon job aborts the whole process, so keep a
+            // syntax bug from taking down the editor.
+            let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || syntax.parse(rev, text, edits.as_deref()),
+            ));
+            if let Ok(true) = parsed {
+                send(syntax);
+            }
         });
     }
 
