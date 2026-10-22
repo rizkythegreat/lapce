@@ -29,7 +29,7 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     app::clickable_icon,
     claude_chat::{
-        ChatMessage, ChatRole, ClaudeChatData, EFFORTS, MODELS, PermissionRequest,
+        ChatMessage, ChatRole, ClaudeChatData, PermissionRequest,
         PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits, UsageWindow,
         mention_query,
     },
@@ -81,6 +81,20 @@ pub fn claude_chat_panel(
                 chat.request_files();
             }
             mention
+        });
+    }
+
+    {
+        let chat = chat.clone();
+        let panel = window_tab_data.panel.clone();
+        // Start Claude Code the first time the panel shows, so the models and
+        // commands are there before the first message
+        create_effect(move |_| {
+            panel.styles.with(|_| ());
+            panel.panels.with(|_| ());
+            if panel.is_panel_visible(&PanelKind::ClaudeChat) {
+                chat.request_commands();
+            }
         });
     }
 
@@ -311,7 +325,12 @@ fn input_toolbar(
     stack((
         container(text_button(
             move || mode(skip.get()),
-            move || show_choice_menu(skip, &[false, true], mode),
+            move || {
+                let choices = vec![(false, mode(false)), (true, mode(true))];
+                show_choice_menu(skip.get_untracked(), choices, move |v| {
+                    skip.set(v)
+                })
+            },
             config,
         ))
         .style(move |s| {
@@ -323,8 +342,8 @@ fn input_toolbar(
             };
             s.color(config.color(color))
         }),
-        choice_button("Model", chat.model, &MODELS, config),
-        choice_button("Effort", chat.effort, &EFFORTS, config),
+        model_button(chat.clone(), config),
+        effort_button(chat.clone(), config),
         empty().style(|s| s.flex_grow(1.0f32)),
         container(text_button(
             || "/",
@@ -381,39 +400,95 @@ fn send_button(
     })
 }
 
-/// Opens a menu of `choices` with the current one checked, None shows as
-/// "default"
-fn choice_button(
-    name: &'static str,
-    value: RwSignal<Option<&'static str>>,
-    choices: &'static [Option<&'static str>],
+/// "Model: Sonnet 5", the menu lists what Claude Code offers this account
+fn model_button(
+    chat: ClaudeChatData,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    let choice_name =
-        |choice: Option<&str>| choice.unwrap_or("default").to_string();
-    container(text_button(
-        move || format!("{name}: {}", choice_name(value.get())),
-        move || show_choice_menu(value, choices, choice_name),
+    let label_chat = chat.clone();
+    menu_button(
+        move || {
+            let model = label_chat.current_model();
+            let version = model.map(|m| m.version().to_string());
+            let model = version.or_else(|| label_chat.model.get());
+            format!("Model: {}", model.as_deref().unwrap_or("default"))
+        },
+        move || {
+            let choices = chat.models.with_untracked(|models| {
+                models
+                    .iter()
+                    .map(|m| {
+                        let value = (m.value != "default").then(|| m.value.clone());
+                        (value, format!("{} · {}", m.name, m.description))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let pick_chat = chat.clone();
+            show_choice_menu(chat.model.get_untracked(), choices, move |model| {
+                pick_chat.set_model(model)
+            });
+        },
         config,
-    ))
-    .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
+    )
 }
 
-/// Native menu of `choices` with the current one checked, picking one sets
-/// `value`
-fn show_choice_menu<T: Copy + PartialEq + 'static>(
-    value: RwSignal<T>,
-    choices: &[T],
-    name: impl Fn(T) -> String,
+/// The effort levels of the current model, hidden when it takes none
+fn effort_button(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let effort = chat.effort;
+    let hide_chat = chat.clone();
+    container(menu_button(
+        move || format!("Effort: {}", effort.get().as_deref().unwrap_or("default")),
+        move || {
+            let model = chat.current_model();
+            let efforts = model.map(|m| m.efforts).unwrap_or_default();
+            let choices = std::iter::once((None, "default".to_string()))
+                .chain(efforts.into_iter().map(|e| (Some(e.clone()), e)))
+                .collect::<Vec<_>>();
+            show_choice_menu(effort.get_untracked(), choices, move |e| {
+                effort.set(e)
+            });
+        },
+        config,
+    ))
+    .style(move |s| {
+        let none = hide_chat
+            .current_model()
+            .is_some_and(|m| m.efforts.is_empty());
+        s.apply_if(none, |s| s.hide())
+    })
+}
+
+/// A dim toolbar label that opens a menu
+fn menu_button(
+    text: impl Fn() -> String + 'static,
+    open: impl Fn() + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    container(text_button(text, open, config))
+        .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
+}
+
+/// Native menu of `choices` with the current one checked, `pick` gets the
+/// chosen value. Says it is loading while `choices` is still empty.
+fn show_choice_menu<T: Clone + PartialEq + 'static>(
+    current: T,
+    choices: Vec<(T, String)>,
+    pick: impl Fn(T) + Clone + 'static,
 ) {
-    let current = value.get_untracked();
-    let menu = choices.iter().fold(Menu::new(""), |menu, &choice| {
+    let mut menu = Menu::new("");
+    if choices.is_empty() {
+        menu = menu.entry(MenuItem::new("Loading…").enabled(false));
+    }
+    for (choice, name) in choices {
         let mark = if choice == current { "✓ " } else { "    " };
-        menu.entry(
-            MenuItem::new(format!("{mark}{}", name(choice)))
-                .action(move || value.set(choice)),
-        )
-    });
+        let pick = pick.clone();
+        let item = MenuItem::new(format!("{mark}{name}"))
+            .action(move || pick(choice.clone()));
+        menu = menu.entry(item);
+    }
     show_context_menu(menu, None);
 }
 

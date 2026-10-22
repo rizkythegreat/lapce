@@ -159,22 +159,29 @@ struct ChatProcess {
     stdin: ChildStdin,
     /// Started with `--dangerously-skip-permissions`
     skip_permissions: bool,
-    model: Option<&'static str>,
-    effort: Option<&'static str>,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
-/// Choices for `--model`, None leaves Claude Code's default
-pub const MODELS: [Option<&str>; 5] =
-    [None, Some("fable"), Some("opus"), Some("sonnet"), Some("haiku")];
-/// Choices for `--effort`, None leaves Claude Code's default
-pub const EFFORTS: [Option<&str>; 6] = [
-    None,
-    Some("low"),
-    Some("medium"),
-    Some("high"),
-    Some("xhigh"),
-    Some("max"),
-];
+/// A model Claude Code offers this account, from its `initialize` answer
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelInfo {
+    /// Passed to `--model`, "default" is Claude Code's own pick
+    pub value: String,
+    /// "Opus"
+    pub name: String,
+    /// "Opus 5 · Best for everyday, complex tasks"
+    pub description: String,
+    /// `--effort` levels, empty when the model takes none
+    pub efforts: Vec<String>,
+}
+
+impl ModelInfo {
+    /// "Opus 5", the head of the description
+    pub fn version(&self) -> &str {
+        self.description.split(" · ").next().unwrap_or(&self.name)
+    }
+}
 
 /// Chat with Claude Code running headless (`claude -p` with stream-json).
 /// The process stays alive across turns; it is respawned with `--resume`
@@ -199,8 +206,12 @@ pub struct ClaudeChatData {
     pub suggestion: RwSignal<Option<String>>,
     /// Run tools without asking. Off on every launch.
     pub skip_permissions: RwSignal<bool>,
-    pub model: RwSignal<Option<&'static str>>,
-    pub effort: RwSignal<Option<&'static str>>,
+    /// Models from Claude Code, empty until its first process answers
+    pub models: RwSignal<Vec<ModelInfo>>,
+    /// None leaves Claude Code's default
+    pub model: RwSignal<Option<String>>,
+    /// None leaves Claude Code's default
+    pub effort: RwSignal<Option<String>>,
     /// Pending tool approvals, oldest first
     pub permissions: RwSignal<im::Vector<PermissionRequest>>,
     /// Refreshed on spawn and after every turn, None until first answered
@@ -283,6 +294,7 @@ impl ClaudeChatData {
             commands_requested: Rc::new(Cell::new(false)),
             suggestion: cx.create_rw_signal(None),
             skip_permissions: cx.create_rw_signal(false),
+            models: cx.create_rw_signal(Vec::new()),
             model: cx.create_rw_signal(None),
             effort: cx.create_rw_signal(None),
             permissions: cx.create_rw_signal(im::Vector::new()),
@@ -509,6 +521,27 @@ impl ClaudeChatData {
 
     /// Start Claude Code early so it can report its slash commands. Starting
     /// the process alone makes no API request.
+    /// The picked model, or the one Claude Code uses by default, tracked
+    pub fn current_model(&self) -> Option<ModelInfo> {
+        let value = self.model.get().unwrap_or_else(|| "default".to_string());
+        self.models
+            .with(|models| models.iter().find(|m| m.value == value).cloned())
+    }
+
+    /// Drops the effort level when the new model does not take it
+    pub fn set_model(&self, model: Option<String>) {
+        self.model.set(model);
+        let efforts = self.current_model().map(|m| m.efforts).unwrap_or_default();
+        if self
+            .effort
+            .with_untracked(|e| e.as_ref().is_some_and(|e| !efforts.contains(e)))
+        {
+            self.effort.set(None);
+        }
+    }
+
+    /// Starts Claude Code once, its `initialize` answer brings the slash
+    /// commands and models. No model request is made.
     pub fn request_commands(&self) {
         if self.commands_requested.replace(true) {
             return;
@@ -672,11 +705,11 @@ impl ClaudeChatData {
             cmd.arg("--dangerously-skip-permissions");
         }
         let model = self.model.get_untracked();
-        if let Some(model) = model {
+        if let Some(model) = &model {
             cmd.args(["--model", model]);
         }
         let effort = self.effort.get_untracked();
-        if let Some(effort) = effort {
+        if let Some(effort) = &effort {
             cmd.args(["--effort", effort]);
         }
         if let Some(id) = self.session_id.get_untracked() {
@@ -782,9 +815,12 @@ impl ClaudeChatData {
                 }
             }
             Some("control_response") => {
-                let commands = &event["response"]["response"]["commands"];
-                if let Some(commands) = parse_commands(commands) {
+                let response = &event["response"]["response"];
+                if let Some(commands) = parse_commands(&response["commands"]) {
                     self.commands.set(commands);
+                }
+                if let Some(models) = parse_models(&response["models"]) {
+                    self.models.set(models);
                 }
             }
             Some("stream_event") => {
@@ -1030,6 +1066,23 @@ fn parse_usage(response: &Value) -> Option<UsageLimits> {
         five_hour: window("five_hour"),
         seven_day: window("seven_day"),
     })
+}
+
+fn parse_models(models: &Value) -> Option<Vec<ModelInfo>> {
+    let field =
+        |m: &Value, key: &str| m[key].as_str().unwrap_or_default().to_string();
+    let models = models.as_array()?.iter().map(|m| ModelInfo {
+        value: field(m, "value"),
+        name: field(m, "displayName"),
+        description: field(m, "description"),
+        efforts: m["supportedEffortLevels"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| Some(e.as_str()?.to_string()))
+            .collect(),
+    });
+    Some(models.filter(|m| !m.value.is_empty()).collect())
 }
 
 fn parse_commands(commands: &Value) -> Option<Vec<SlashCommand>> {
@@ -1291,9 +1344,25 @@ mod tests {
         ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
         mention_query, parse_commands, parse_permission, parse_suggestion,
         parse_usage, path_mention, permission_response, project_dir_name,
-        read_history, replace_last_token, result_summary, result_text,
-        session_title, tool_call, tool_summary,
+        parse_models, read_history, replace_last_token, result_summary,
+        result_text, session_title, tool_call, tool_summary,
     };
+
+    #[test]
+    fn models_from_initialize() {
+        let models = json!([
+            {"value": "default", "displayName": "Default (recommended)",
+             "description": "Sonnet 5 · Efficient",
+             "supportedEffortLevels": ["low"]},
+            {"value": "haiku", "displayName": "Haiku",
+             "description": "Haiku 4.5 · Fastest"},
+        ]);
+        let models = parse_models(&models).unwrap();
+        assert_eq!(models[0].version(), "Sonnet 5");
+        assert_eq!(models[0].efforts, ["low"]);
+        assert!(models[1].efforts.is_empty());
+        assert!(parse_models(&json!(null)).is_none());
+    }
 
     #[test]
     fn result_summary_per_tool() {
