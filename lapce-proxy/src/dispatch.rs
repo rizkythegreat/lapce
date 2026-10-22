@@ -1723,7 +1723,12 @@ fn git_blame(
                 id: oid.to_string(),
                 author: c.author().name().unwrap_or_default().to_string(),
                 time: c.time().seconds(),
-                summary: c.summary().unwrap_or_default().to_string(),
+                summary: c
+                    .summary()
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .to_string(),
             };
             commits.insert(oid, commit.clone());
             Some(commit)
