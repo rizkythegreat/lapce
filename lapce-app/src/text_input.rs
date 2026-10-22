@@ -17,7 +17,7 @@ use floem::{
     },
     style::{
         CursorStyle, FontFamily, FontSize, FontStyle, FontWeight, LineHeight,
-        PaddingLeft, Style, TextColor,
+        PaddingLeft, PaddingTop, Style, TextColor,
     },
     taffy::prelude::NodeId,
     text::{Attrs, AttrsList, FamilyOwned, TextLayout},
@@ -416,16 +416,21 @@ impl TextInput {
     fn hit_index(&self, _cx: &mut EventCx, point: Point) -> usize {
         self.text_layout.with_untracked(|text_layout| {
             if let Some(text_layout) = text_layout.as_ref() {
-                let padding_left =
-                    match self.id.get_combined_style().get(PaddingLeft) {
-                        PxPct::Px(v) => v,
-                        PxPct::Pct(pct) => {
-                            let layout = self.id.get_layout().unwrap_or_default();
-                            pct * layout.size.width as f64
-                        }
-                    };
-                let hit =
-                    text_layout.hit_point(Point::new(point.x - padding_left, 0.0));
+                let style = self.id.get_combined_style();
+                let padding = |padding: PxPct| match padding {
+                    PxPct::Px(v) => v,
+                    PxPct::Pct(pct) => {
+                        let layout = self.id.get_layout().unwrap_or_default();
+                        pct * layout.size.width as f64
+                    }
+                };
+                let padding_left = padding(style.get(PaddingLeft));
+                let padding_top = padding(style.get(PaddingTop));
+                // y picks the line when the text has several
+                let hit = text_layout.hit_point(Point::new(
+                    point.x - padding_left,
+                    point.y - padding_top,
+                ));
                 hit.index.min(self.content.len())
             } else {
                 0
@@ -713,7 +718,6 @@ impl View for TextInput {
 
         self.text_layout.with_untracked(|text_layout| {
             let text_layout = text_layout.as_ref().unwrap();
-            let height = text_layout.size().height;
             let config = self.config.get_untracked();
 
             let cursor = self.cursor().get_untracked();
@@ -721,15 +725,15 @@ impl View for TextInput {
             if let CursorMode::Insert(selection) = &cursor.mode {
                 for region in selection.regions() {
                     if !region.is_caret() {
-                        let min = text_layout.hit_position(region.min()).point.x;
-                        let max = text_layout.hit_position(region.max()).point.x;
-                        cx.fill(
-                            &Rect::ZERO
-                                .with_size(Size::new(max - min, height))
-                                .with_origin(Point::new(min + point.x, point.y)),
-                            config.color(LapceColor::EDITOR_SELECTION),
-                            0.0,
-                        );
+                        let rects =
+                            selection_rects(text_layout, region.min(), region.max());
+                        for rect in rects {
+                            cx.fill(
+                                &(rect + point.to_vec2()),
+                                config.color(LapceColor::EDITOR_SELECTION),
+                                0.0,
+                            );
+                        }
                     }
                 }
             }
@@ -798,4 +802,31 @@ impl View for TextInput {
             cx.restore();
         });
     }
+}
+
+/// Highlight of the `min..max` byte range, a rect per line it covers
+fn selection_rects(text_layout: &TextLayout, min: usize, max: usize) -> Vec<Rect> {
+    let ranges = text_layout.lines_range();
+    let cursor = |offset: usize| {
+        let line = ranges
+            .iter()
+            .position(|range| offset <= range.end)
+            .unwrap_or(ranges.len().saturating_sub(1));
+        let start = ranges.get(line).map_or(0, |range| range.start);
+        floem::text::Cursor::new(line, offset.saturating_sub(start))
+    };
+    let (start, end) = (cursor(min), cursor(max));
+    text_layout
+        .layout_runs()
+        .filter_map(|run| {
+            let (x, width) = run.highlight(start, end)?;
+            let top = run.line_top as f64;
+            Some(Rect::new(
+                x as f64,
+                top,
+                (x + width) as f64,
+                top + run.line_height as f64,
+            ))
+        })
+        .collect()
 }
