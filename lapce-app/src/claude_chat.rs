@@ -160,6 +160,15 @@ impl ContextUsage {
     }
 }
 
+/// Model and effort a running Claude Code actually uses, settings files
+/// included, from its `get_settings`
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AppliedSettings {
+    /// Model id, "claude-opus-5"
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 /// Plan usage of each window, from Claude Code's `get_usage`
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UsageLimits {
@@ -198,6 +207,8 @@ pub struct ModelInfo {
     pub name: String,
     /// "Opus 5 · Best for everyday, complex tasks"
     pub description: String,
+    /// Model id the value stands for, "claude-opus-5"
+    pub resolved: String,
     /// `--effort` levels, empty when the model takes none
     pub efforts: Vec<String>,
 }
@@ -245,6 +256,8 @@ pub struct ClaudeChatData {
     pub usage: RwSignal<Option<UsageLimits>>,
     /// None until the session's first reply
     pub context: RwSignal<Option<ContextUsage>>,
+    /// What "default" model and effort turn out to be, None until answered
+    pub applied: RwSignal<Option<AppliedSettings>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -329,6 +342,7 @@ impl ClaudeChatData {
             permissions: cx.create_rw_signal(im::Vector::new()),
             usage: cx.create_rw_signal(None),
             context: cx.create_rw_signal(None),
+            applied: cx.create_rw_signal(None),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -550,11 +564,23 @@ impl ClaudeChatData {
 
     /// Start Claude Code early so it can report its slash commands. Starting
     /// the process alone makes no API request.
-    /// The picked model, or the one Claude Code uses by default, tracked
+    /// The picked model, or the one Claude Code applies by default (settings
+    /// files can override the account's default), tracked
     pub fn current_model(&self) -> Option<ModelInfo> {
-        let value = self.model.get().unwrap_or_else(|| "default".to_string());
-        self.models
-            .with(|models| models.iter().find(|m| m.value == value).cloned())
+        let picked = self.model.get();
+        let applied = self.applied.with(|a| a.as_ref()?.model.clone());
+        self.models.with(|models| {
+            let by_value = |value: &str| models.iter().find(|m| m.value == value);
+            let found = match (&picked, &applied) {
+                (Some(value), _) => by_value(value),
+                (None, Some(model)) => models
+                    .iter()
+                    .find(|m| &m.resolved == model)
+                    .or_else(|| by_value("default")),
+                (None, None) => by_value("default"),
+            };
+            found.cloned()
+        })
     }
 
     /// Switches the running process too. Drops the effort level when the new
@@ -566,6 +592,8 @@ impl ClaudeChatData {
             "lapce-set-model",
             json!({ "subtype": "set_model", "model": value }),
         );
+        // The model can bring its own effort from the settings files
+        self.request_settings();
         let efforts = self.current_model().map(|m| m.efforts).unwrap_or_default();
         if self
             .effort
@@ -828,10 +856,16 @@ impl ClaudeChatData {
             "request": { "subtype": "initialize" },
         }))?;
         self.request_usage();
+        self.request_settings();
         Ok(())
     }
 
     /// Ask for plan usage, read from the claude.ai usage endpoint, no model request
+    /// Ask which model and effort apply, answered without an API request
+    fn request_settings(&self) {
+        self.control("lapce-settings", json!({ "subtype": "get_settings" }));
+    }
+
     fn request_usage(&self) {
         let _ = self.write_line(&json!({
             "type": "control_request",
@@ -867,6 +901,14 @@ impl ClaudeChatData {
             Some("control_cancel_request") => {
                 if let Some(id) = event["request_id"].as_str() {
                     self.permissions.update(|p| p.retain(|r| r.request_id != id));
+                }
+            }
+            Some("control_response")
+                if event["response"]["request_id"] == "lapce-settings" =>
+            {
+                let applied = &event["response"]["response"]["applied"];
+                if applied.is_object() {
+                    self.applied.set(Some(parse_applied(applied)));
                 }
             }
             Some("control_response")
@@ -1162,6 +1204,14 @@ fn parse_usage(response: &Value) -> Option<UsageLimits> {
     })
 }
 
+fn parse_applied(applied: &Value) -> AppliedSettings {
+    let field = |key: &str| applied[key].as_str().map(str::to_string);
+    AppliedSettings {
+        model: field("model"),
+        effort: field("effort"),
+    }
+}
+
 fn parse_models(models: &Value) -> Option<Vec<ModelInfo>> {
     let field =
         |m: &Value, key: &str| m[key].as_str().unwrap_or_default().to_string();
@@ -1169,6 +1219,7 @@ fn parse_models(models: &Value) -> Option<Vec<ModelInfo>> {
         value: field(m, "value"),
         name: field(m, "displayName"),
         description: field(m, "description"),
+        resolved: field(m, "resolvedModel"),
         efforts: m["supportedEffortLevels"]
             .as_array()
             .into_iter()
@@ -1452,8 +1503,9 @@ mod tests {
         ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
         mention_query, parse_commands, parse_permission, parse_suggestion,
         parse_usage, path_mention, permission_response, project_dir_name,
-        parse_models, read_history, replace_last_token, request_tokens,
-        result_summary, result_text, session_title, tool_call, tool_summary,
+        parse_applied, parse_models, read_history, replace_last_token,
+        request_tokens, result_summary, result_text, session_title, tool_call,
+        tool_summary,
     };
 
     #[test]
@@ -1482,6 +1534,11 @@ mod tests {
         assert_eq!(models[0].efforts, ["low"]);
         assert!(models[1].efforts.is_empty());
         assert!(parse_models(&json!(null)).is_none());
+
+        let applied = json!({"model": "claude-opus-5", "effort": "xhigh"});
+        let applied = parse_applied(&applied);
+        assert_eq!(applied.effort.as_deref(), Some("xhigh"));
+        assert_eq!(parse_applied(&json!({"effort": null})).model, None);
     }
 
     #[test]

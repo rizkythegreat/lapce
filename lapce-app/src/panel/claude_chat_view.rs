@@ -316,6 +316,8 @@ fn text_button<S: std::fmt::Display + 'static>(
         .style(move |s| {
             let config = config.get();
             s.padding_horiz(8.0)
+                .min_width(0.0)
+                .text_ellipsis()
                 .border_radius(4.0)
                 .hover(|s| {
                     s.cursor(CursorStyle::Pointer).background(
@@ -341,7 +343,7 @@ fn input_toolbar(
     };
     let slash_chat = chat.clone();
     let mode_chat = chat.clone();
-    stack((
+    let left = stack((
         container(text_button(
             move || mode_name(mode.get()),
             move || {
@@ -363,12 +365,22 @@ fn input_toolbar(
             } else {
                 LapceColor::EDITOR_DIM
             };
-            s.color(config.color(color))
+            s.color(config.color(color)).min_width(0.0)
         }),
         model_button(chat.clone(), config),
         effort_button(chat.clone(), config),
+    ))
+    // Gives way first in a narrow panel, the labels end in "…"
+    .style(|s| {
+        s.items_center()
+            .gap(2.0)
+            .flex_grow(1.0f32)
+            .flex_basis(0.0)
+            .min_width(0.0)
+    });
+    stack((
+        left,
         context_view(chat.context, config),
-        empty().style(|s| s.flex_grow(1.0f32)),
         container(text_button(
             || "/",
             move || {
@@ -424,37 +436,36 @@ fn send_button(
     })
 }
 
-/// "21% context", amber from 80% and red from 95% so a `/compact` or new
-/// chat comes in time. Hover shows the tokens and Claude Code's cost estimate.
+/// A ring that fills with the context, amber from 80% and red from 95% so a
+/// `/compact` or new chat comes in time. Hover shows the numbers and Claude
+/// Code's cost estimate.
 fn context_view(
     context: RwSignal<Option<ContextUsage>>,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    let text = label(move || {
-        let Some(context) = context.get() else {
-            return String::new();
-        };
-        match context.percent() {
-            Some(percent) => format!("{percent:.0}% context"),
-            None => format!("{} tokens", compact_count(context.tokens)),
-        }
-    })
-    .style(move |s| {
+    let ring = svg(move || {
         let config = config.get();
         let percent = context.with(|c| c.as_ref().and_then(|c| c.percent()));
-        let color = match percent {
+        let fill = match percent {
             Some(p) if p >= 95.0 => LapceColor::LAPCE_ERROR,
             Some(p) if p >= 80.0 => LapceColor::LAPCE_WARN,
             _ => LapceColor::EDITOR_DIM,
         };
-        s.padding_horiz(8.0)
-            .color(config.color(color))
-            .selectable(false)
-    });
-    container(tooltip_label(config, text, move || {
+        ring_svg(
+            percent.unwrap_or(0.0),
+            config.color(LapceColor::LAPCE_BORDER),
+            config.color(fill),
+        )
+    })
+    .style(|s| s.size(16.0, 16.0).margin_horiz(6.0));
+    container(tooltip_label(config, ring, move || {
         let Some(context) = context.get_untracked() else {
             return String::new();
         };
+        let percent = context
+            .percent()
+            .map(|p| format!("{p:.0}% context · "))
+            .unwrap_or_default();
         let window = context
             .window
             .map(|w| format!(" / {}", compact_count(w)))
@@ -463,9 +474,33 @@ fn context_view(
             .cost
             .map(|c| format!(" · ${c:.2} at API prices"))
             .unwrap_or_default();
-        format!("{} tokens{window}{cost}", compact_count(context.tokens))
+        let tokens = compact_count(context.tokens);
+        format!("{percent}{tokens}{window} tokens{cost}")
     }))
     .style(move |s| s.apply_if(context.with(|c| c.is_none()), |s| s.hide()))
+}
+
+/// 16px ring, a track with an arc from the top clockwise for `percent`
+fn ring_svg(percent: f64, track: Color, fill: Color) -> String {
+    let hex = |color: Color| {
+        let c = color.to_rgba8();
+        format!("#{:02x}{:02x}{:02x}", c.r, c.g, c.b)
+    };
+    let circumference = 2.0 * std::f64::consts::PI * 6.0;
+    let arc = circumference * percent.clamp(0.0, 100.0) / 100.0;
+    format!(
+        concat!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" "#,
+            r#"width="16" height="16">"#,
+            r#"<circle cx="8" cy="8" r="6" fill="none" stroke="{track}" "#,
+            r#"stroke-width="2"/>"#,
+            r#"<circle cx="8" cy="8" r="6" fill="none" stroke="{fill}" "#,
+            r#"stroke-width="2" stroke-dasharray="{arc:.2} {circumference:.2}" "#,
+            r#"transform="rotate(-90 8 8)"/></svg>"#,
+        ),
+        track = hex(track),
+        fill = hex(fill),
+    )
 }
 
 /// 42600 as "42.6k", 1000000 as "1M"
@@ -517,13 +552,23 @@ fn effort_button(
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let effort = chat.effort;
+    let applied = chat.applied;
     let hide_chat = chat.clone();
+    // What Claude Code applies when nothing is picked, from the settings files
+    let applied_effort = move || applied.with(|a| a.as_ref()?.effort.clone());
     container(menu_button(
-        move || format!("Effort: {}", effort.get().as_deref().unwrap_or("default")),
+        move || {
+            let effort = effort.get().or_else(applied_effort);
+            format!("Effort: {}", effort.as_deref().unwrap_or("default"))
+        },
         move || {
             let model = chat.current_model();
             let efforts = model.map(|m| m.efforts).unwrap_or_default();
-            let choices = std::iter::once((None, "default".to_string()))
+            let default = match applied_effort() {
+                Some(effort) => format!("default ({effort})"),
+                None => "default".to_string(),
+            };
+            let choices = std::iter::once((None, default))
                 .chain(efforts.into_iter().map(|e| (Some(e.clone()), e)))
                 .collect::<Vec<_>>();
             show_choice_menu(effort.get_untracked(), choices, move |e| {
@@ -536,7 +581,7 @@ fn effort_button(
         let none = hide_chat
             .current_model()
             .is_some_and(|m| m.efforts.is_empty());
-        s.apply_if(none, |s| s.hide())
+        s.min_width(0.0).apply_if(none, |s| s.hide())
     })
 }
 
@@ -546,8 +591,9 @@ fn menu_button(
     open: impl Fn() + 'static,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    container(text_button(text, open, config))
-        .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
+    container(text_button(text, open, config)).style(move |s| {
+        s.color(config.get().color(LapceColor::EDITOR_DIM)).min_width(0.0)
+    })
 }
 
 /// Native menu of `choices` with the current one checked, `pick` gets the
@@ -1464,7 +1510,18 @@ fn tool_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_count, split_line};
+    use floem::peniko::Color;
+
+    use super::{compact_count, ring_svg, split_line};
+
+    #[test]
+    fn ring_arc_follows_percent() {
+        let ring = |p| ring_svg(p, Color::BLACK, Color::WHITE);
+        assert!(ring(0.0).contains(r#"stroke-dasharray="0.00 37.70""#));
+        assert!(ring(50.0).contains(r#"stroke-dasharray="18.85 37.70""#));
+        assert!(ring(150.0).contains(r#"stroke-dasharray="37.70 37.70""#));
+        assert!(ring(0.0).contains("#ffffff"));
+    }
 
     #[test]
     fn compact_counts() {
