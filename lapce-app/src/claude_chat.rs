@@ -16,6 +16,7 @@ use floem::{
     reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
 };
 use lapce_core::{
+    buffer::rope_text::RopeText,
     command::{EditCommand, FocusCommand},
     directory::Directory,
     mode::Mode,

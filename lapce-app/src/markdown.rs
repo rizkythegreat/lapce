@@ -403,7 +403,7 @@ pub fn table_view(rows: Vec<Vec<TextLayout>>, border: Color) -> impl View {
     // Cells measure at their unwrapped width, a zero minimum lets columns
     // shrink to the available width so the cells wrap instead of overflowing
     let tracks: Vec<TrackSizingFunction> =
-        vec![minmax(length(0.0), auto()); columns];
+        vec![minmax(length(0.0_f32), auto()); columns];
     stack_from_iter(cells.map(move |cell| {
         rich_text(move || cell.clone()).style(move |s| {
             s.padding_horiz(8.0)
