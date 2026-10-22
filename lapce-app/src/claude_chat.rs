@@ -40,17 +40,31 @@ pub enum ChatRole {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub id: u64,
     pub role: ChatRole,
     pub text: RwSignal<String>,
     pub tool: Option<ToolCall>,
+    /// Only meaningful for tool messages
+    pub status: RwSignal<ToolStatus>,
+    /// First message of a user or Claude turn, gets the turn label
+    pub first_in_turn: bool,
 }
 
 /// What a tool message can show beyond its one line summary
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolCall {
+    /// `tool_use` id, matched by the later `tool_result`
+    pub id: String,
+    pub name: String,
     pub file: Option<PathBuf>,
     /// Edit, Write and friends, the file has changes worth reviewing
     pub edits_file: bool,
@@ -299,6 +313,25 @@ impl ClaudeChatData {
         self.permissions.set(im::Vector::new());
         self.suggestion.set(None);
         self.busy.set(false);
+        // Tools cut off by the kill never report a result
+        self.messages.with_untracked(|messages| {
+            for msg in messages {
+                if msg.status.get_untracked() == ToolStatus::Running {
+                    msg.status.set(ToolStatus::Failed);
+                }
+            }
+        });
+    }
+
+    /// Name of the tool Claude is waiting on, tracked
+    pub fn running_tool(&self) -> Option<String> {
+        self.messages.with(|messages| {
+            let msg = messages
+                .iter()
+                .rev()
+                .find(|msg| msg.status.get() == ToolStatus::Running)?;
+            Some(msg.tool.as_ref()?.name.clone())
+        })
     }
 
     pub fn answer_permission(&self, request_id: &str, decision: PermissionDecision) {
@@ -459,7 +492,9 @@ impl ClaudeChatData {
             // Ignore if another session was picked while loading
             if chat.session_id.get_untracked().as_deref() == Some(&current) {
                 for (role, text, tool) in history {
-                    chat.push_message(role, text, tool);
+                    // ponytail: history tools show as done, failures in
+                    // the file's tool_result are not read back
+                    chat.push_message(role, text, tool, ToolStatus::Done);
                 }
             }
         });
@@ -621,7 +656,23 @@ impl ClaudeChatData {
                             ChatRole::Tool,
                             tool_summary(block),
                             Some(tool_call(block)),
+                            ToolStatus::Running,
                         );
+                    }
+                }
+            }
+            Some("user") => {
+                let blocks = event["message"]["content"].as_array();
+                for block in blocks.into_iter().flatten() {
+                    if block["type"] == "tool_result"
+                        && let Some(id) = block["tool_use_id"].as_str()
+                    {
+                        let status = if block["is_error"] == true {
+                            ToolStatus::Failed
+                        } else {
+                            ToolStatus::Done
+                        };
+                        self.set_tool_status(id, status);
                     }
                 }
             }
@@ -648,20 +699,41 @@ impl ClaudeChatData {
     }
 
     fn push(&self, role: ChatRole, text: String) {
-        self.push_message(role, text, None);
+        self.push_message(role, text, None, ToolStatus::Done);
     }
 
-    fn push_message(&self, role: ChatRole, text: String, tool: Option<ToolCall>) {
+    fn push_message(
+        &self,
+        role: ChatRole,
+        text: String,
+        tool: Option<ToolCall>,
+        status: ToolStatus,
+    ) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
-        let text = self.scope.create_rw_signal(text);
+        let previous = self.messages.with_untracked(|m| m.last().map(|m| m.role));
+        let first_in_turn = role == ChatRole::User
+            || previous.is_none_or(|previous| previous == ChatRole::User);
         let msg = ChatMessage {
             id,
             role,
-            text,
+            text: self.scope.create_rw_signal(text),
             tool,
+            status: self.scope.create_rw_signal(status),
+            first_in_turn,
         };
         self.messages.update(|messages| messages.push_back(msg));
+    }
+
+    fn set_tool_status(&self, tool_use_id: &str, status: ToolStatus) {
+        self.messages.with_untracked(|messages| {
+            let msg = messages.iter().rev().find(|msg| {
+                msg.tool.as_ref().is_some_and(|tool| tool.id == tool_use_id)
+            });
+            if let Some(msg) = msg {
+                msg.status.set(status);
+            }
+        });
     }
 
     fn append_assistant(&self, delta: &str) {
@@ -961,6 +1033,8 @@ fn tool_call(block: &Value) -> ToolCall {
         lines.join("\n")
     });
     ToolCall {
+        id: block["id"].as_str().unwrap_or_default().to_string(),
+        name: name.to_string(),
         file,
         edits_file: matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit"),
         diff,

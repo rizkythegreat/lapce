@@ -1,33 +1,37 @@
 use std::{
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, atomic::AtomicU64},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use floem::{
     IntoView, View,
+    action::exec_after,
     event::EventListener,
     kurbo::Rect,
     peniko::Color,
     reactive::{
-        ReadSignal, SignalGet, SignalUpdate, SignalWith, create_effect, create_memo,
-        create_rw_signal,
+        ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith, create_effect,
+        create_memo, create_rw_signal,
     },
     style::{CursorStyle, Style},
-    text::{Attrs, AttrsList, LineHeightValue, TextLayout},
+    text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout},
     views::{
         Decorators, container, dyn_stack, empty, label, rich_text, scroll, stack,
+        svg,
     },
 };
 
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
+    app::clickable_icon,
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, PermissionDecision, PermissionRequest,
-        PopupItem, SessionInfo, ToolCall, mention_query,
+        PopupItem, SessionInfo, ToolCall, ToolStatus, mention_query,
     },
     command::InternalCommand,
-    config::{LapceConfig, color::LapceColor},
+    config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     doc::relative_time,
     listener::Listener,
     markdown::{MarkdownContent, parse_markdown},
@@ -47,6 +51,7 @@ pub fn claude_chat_panel(
     let show_sessions = chat.show_sessions;
     let suggestion = chat.suggestion;
     let internal_command = chat.common.internal_command;
+    let workspace = chat.common.workspace.path.clone();
     let is_focused = move || focus.get() == Focus::Panel(PanelKind::ClaudeChat);
     let content_height = create_rw_signal(0.0);
     // Scroll content is unbounded, give it the visible width so text wraps
@@ -80,11 +85,18 @@ pub fn claude_chat_panel(
                 dyn_stack(
                     move || messages.get(),
                     |msg| msg.id,
-                    move |msg| message_view(msg, internal_command, config),
+                    move |msg| {
+                        message_view(
+                            msg,
+                            workspace.clone(),
+                            internal_command,
+                            config,
+                        )
+                    },
                 )
                 .on_resize(move |rect| content_height.set(rect.height()))
                 .style(move |s| {
-                    s.flex_col().width(scroll_width.get()).padding(10.0).gap(10.0)
+                    s.flex_col().width(scroll_width.get()).padding(12.0).gap(6.0)
                 }),
             )
             // Follow the conversation as it grows
@@ -105,11 +117,7 @@ pub fn claude_chat_panel(
                 .flex_basis(0.0)
                 .apply_if(show_sessions.get(), |s| s.hide())
         }),
-        label(|| "Claude is working".to_string()).style(move |s| {
-            s.padding_horiz(10.0)
-                .color(config.get().color(LapceColor::EDITOR_DIM))
-                .apply_if(!busy.get(), |s| s.hide())
-        }),
+        working_view(chat.clone(), config),
         permission_view(chat.clone(), config),
         command_popup(chat.clone(), config),
         stack((
@@ -123,39 +131,41 @@ pub fn claude_chat_panel(
                 .style(|s| s.flex_grow(1.0f32).min_width(0.0)),
             {
                 let chat = chat.clone();
-                let button_text = move || if busy.get() { "Stop" } else { "Send" };
-                label(move || button_text().to_string())
-                    .on_click_stop(move |_| {
+                clickable_icon(
+                    move || {
+                        if busy.get() {
+                            LapceIcons::DEBUG_STOP
+                        } else {
+                            LapceIcons::LOCATION_FORWARD
+                        }
+                    },
+                    move || {
                         if busy.get_untracked() {
                             chat.stop();
                         } else {
                             chat.send();
                         }
-                    })
-                    .style(move |s| {
-                        let config = config.get();
-                        s.padding_horiz(10.0)
-                            .border_left(1.0)
-                            .border_color(config.color(LapceColor::LAPCE_BORDER))
-                            .hover(|s| {
-                                s.cursor(CursorStyle::Pointer).background(
-                                    config
-                                        .color(LapceColor::PANEL_HOVERED_BACKGROUND),
-                                )
-                            })
-                            .selectable(false)
-                    })
+                    },
+                    || false,
+                    || false,
+                    move || if busy.get() { "Stop" } else { "Send" },
+                    config,
+                )
+                .style(|s| s.margin_right(4.0))
             },
         ))
         .on_event_cont(EventListener::PointerDown, move |_| {
             focus.set(Focus::Panel(PanelKind::ClaudeChat));
         })
         .style(move |s| {
+            let config = config.get();
             s.margin(10.0)
+                .padding_left(4.0)
                 .items_center()
                 .border(1.0)
-                .border_radius(6.0)
-                .border_color(config.get().color(LapceColor::LAPCE_BORDER))
+                .border_radius(8.0)
+                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .background(config.color(LapceColor::EDITOR_BACKGROUND))
         }),
     ))
     .style(|s| s.absolute().size_pct(100.0, 100.0).flex_col())
@@ -170,7 +180,13 @@ fn header(chat: ClaudeChatData, config: ReadSignal<Arc<LapceConfig>>) -> impl Vi
         text_button(|| "New chat", move || chat.new_session(), config),
         // Applies from the next message, the process restarts on the same session
         container(text_button(
-            move || if skip.get() { "Permissions: skip" } else { "Permissions: ask" },
+            move || {
+                if skip.get() {
+                    "Permissions: skip"
+                } else {
+                    "Permissions: ask"
+                }
+            },
             move || skip.update(|skip| *skip = !*skip),
             config,
         ))
@@ -219,6 +235,59 @@ fn text_button(
         })
 }
 
+/// "Thinking...", "Running Bash..." or "Waiting for approval..." while busy
+fn working_view(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let busy = chat.busy;
+    let permissions = chat.permissions;
+    let tick = create_rw_signal(0usize);
+    // Each animation chain stops itself once a newer one starts
+    let chain = create_rw_signal(0u64);
+    create_effect(move |was_busy: Option<bool>| {
+        let busy_now = busy.get();
+        if busy_now && was_busy != Some(true) {
+            let id = chain.get_untracked() + 1;
+            chain.set(id);
+            animate(busy, tick, chain, id);
+        }
+        busy_now
+    });
+    let running = create_memo(move |_| chat.running_tool());
+
+    label(move || {
+        let dots = ".".repeat(tick.get() % 3 + 1);
+        if permissions.with(|p| !p.is_empty()) {
+            format!("Waiting for approval{dots}")
+        } else if let Some(tool) = running.get() {
+            format!("Running {tool}{dots}")
+        } else {
+            format!("Thinking{dots}")
+        }
+    })
+    .style(move |s| {
+        s.padding_horiz(14.0)
+            .padding_vert(2.0)
+            .color(config.get().color(LapceColor::EDITOR_DIM))
+            .apply_if(!busy.get(), |s| s.hide())
+    })
+}
+
+fn animate(
+    busy: RwSignal<bool>,
+    tick: RwSignal<usize>,
+    chain: RwSignal<u64>,
+    id: u64,
+) {
+    exec_after(Duration::from_millis(400), move |_| {
+        if busy.get_untracked() && chain.get_untracked() == id {
+            tick.update(|tick| *tick += 1);
+            animate(busy, tick, chain, id);
+        }
+    });
+}
+
 /// Wrapping plain text in the UI font
 fn plain_text(text: &str, color: Color, config: &LapceConfig) -> TextLayout {
     let attrs = Attrs::new()
@@ -227,6 +296,34 @@ fn plain_text(text: &str, color: Color, config: &LapceConfig) -> TextLayout {
         .line_height(LineHeightValue::Normal(1.8));
     let mut layout = TextLayout::new();
     layout.set_text(text, AttrsList::new(attrs), None);
+    layout
+}
+
+/// Diff preview in the editor font, removed lines red and added lines green
+fn diff_layout(diff: &str, config: &LapceConfig) -> TextLayout {
+    let family: Vec<FamilyOwned> =
+        FamilyOwned::parse_list(&config.editor.font_family).collect();
+    let attrs = Attrs::new()
+        .family(&family)
+        .font_size(config.ui.font_size() as f32)
+        .line_height(LineHeightValue::Normal(1.5))
+        .color(config.color(LapceColor::EDITOR_DIM));
+    let mut attrs_list = AttrsList::new(attrs.clone());
+    let mut start = 0;
+    for line in diff.split('\n') {
+        let color = match line.chars().next() {
+            Some('+') => Some(LapceColor::SOURCE_CONTROL_ADDED),
+            Some('-') => Some(LapceColor::SOURCE_CONTROL_REMOVED),
+            _ => None,
+        };
+        if let Some(color) = color {
+            let span = attrs.clone().color(config.color(color));
+            attrs_list.add_span(start..start + line.len(), span);
+        }
+        start += line.len() + 1;
+    }
+    let mut layout = TextLayout::new();
+    layout.set_text(diff, attrs_list, None);
     layout
 }
 
@@ -447,47 +544,86 @@ fn session_row(
     })
 }
 
+/// One message with its turn label: user prompts as a right-aligned bubble,
+/// Claude's text full width, tools as compact cards
 fn message_view(
     msg: ChatMessage,
+    workspace: Option<PathBuf>,
     internal_command: Listener<InternalCommand>,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let role = msg.role;
-    let text = msg.text;
-    let diff = msg.tool.as_ref().and_then(|tool| tool.diff.clone());
+    let first_in_turn = msg.first_in_turn;
+    let turn_label = if role == ChatRole::User { "You" } else { "Claude" };
+    let body = match role {
+        ChatRole::User => container(text_view(msg.text, role, config))
+            .style(move |s| {
+                let bg = config.get().color(LapceColor::PANEL_CURRENT_BACKGROUND);
+                s.max_width_pct(85.0)
+                    .padding_horiz(10.0)
+                    .padding_vert(6.0)
+                    .border_radius(8.0)
+                    .background(bg)
+            })
+            .into_any(),
+        ChatRole::Assistant => text_view(msg.text, role, config).into_any(),
+        ChatRole::Tool => {
+            tool_card(msg, workspace, internal_command, config).into_any()
+        }
+        ChatRole::Error => container(text_view(msg.text, role, config))
+            .style(move |s| {
+                s.width_full()
+                    .padding_left(8.0)
+                    .border_left(2.0)
+                    .border_color(config.get().color(LapceColor::LAPCE_ERROR))
+            })
+            .into_any(),
+    };
+    stack((
+        label(move || turn_label.to_string()).style(move |s| {
+            s.font_bold()
+                .margin_bottom(2.0)
+                .color(config.get().color(LapceColor::EDITOR_DIM))
+                .apply_if(!first_in_turn, |s| s.hide())
+        }),
+        body,
+    ))
+    .style(move |s| {
+        s.flex_col()
+            .width_full()
+            .apply_if(role == ChatRole::User, |s| s.items_end())
+            .apply_if(first_in_turn, |s| s.margin_top(10.0))
+    })
+}
+
+/// Markdown for prompts and replies, plain text for errors
+fn text_view(
+    text: RwSignal<String>,
+    role: ChatRole,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
     let id = AtomicU64::new(0);
-    let content = dyn_stack(
+    dyn_stack(
         move || {
             let config = config.get();
             text.with(|text| match role {
-                ChatRole::User | ChatRole::Assistant => {
-                    parse_markdown(text, 1.8, &config)
-                }
-                ChatRole::Tool => {
-                    let color = config.color(LapceColor::EDITOR_DIM);
-                    let summary = plain_text(text, color, &config);
-                    let mut content = vec![MarkdownContent::Text(summary)];
-                    if let Some(diff) = diff.as_ref() {
-                        let diff = format!("````diff\n{diff}\n````");
-                        content.extend(parse_markdown(&diff, 1.5, &config));
-                    }
-                    content
-                }
                 ChatRole::Error => {
                     let color = config.color(LapceColor::LAPCE_ERROR);
                     vec![MarkdownContent::Text(plain_text(text, color, &config))]
                 }
+                _ => parse_markdown(text, 1.8, &config),
             })
         },
         move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         move |content| match content {
+            // A bubble shrinks to short prompts, so only cap the width there
             MarkdownContent::Text(text_layout) => {
-                container(
-                    rich_text(move || text_layout.clone())
-                        .style(|s| s.width_full()),
-                )
-                .style(|s| s.width_full())
-                .into_any()
+                rich_text(move || text_layout.clone())
+                    .style(move |s| {
+                        s.apply_if(role == ChatRole::User, |s| s.max_width_full())
+                            .apply_if(role != ChatRole::User, |s| s.width_full())
+                    })
+                    .into_any()
             }
             MarkdownContent::Image { .. } => empty().into_any(),
             MarkdownContent::Separator => empty()
@@ -500,28 +636,123 @@ fn message_view(
                 .into_any(),
         },
     )
-    .style(|s| s.flex_col().width_full());
+    .style(|s| s.flex_col().max_width_full())
+}
 
-    let actions = tool_actions(msg.tool, internal_command, config);
-    stack((content, actions)).style(move |s| {
+fn tool_icon(name: &str) -> &'static str {
+    match name {
+        "Bash" => LapceIcons::TERMINAL,
+        "Grep" | "Glob" => LapceIcons::SEARCH,
+        "WebFetch" | "WebSearch" => LapceIcons::LINK,
+        "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => LapceIcons::FILE,
+        _ => LapceIcons::SETTINGS,
+    }
+}
+
+/// One line per tool call: icon, name, target and status. Clicking opens the
+/// diff preview and the file buttons.
+fn tool_card(
+    msg: ChatMessage,
+    workspace: Option<PathBuf>,
+    internal_command: Listener<InternalCommand>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let tool = msg.tool.clone();
+    let status = msg.status;
+    let name = tool.as_ref().map(|t| t.name.clone()).unwrap_or_default();
+    let icon = tool_icon(&name);
+    let summary = msg.text.get_untracked();
+    let detail = match tool.as_ref().and_then(|t| t.file.as_deref()) {
+        Some(file) => display_path(file, workspace.as_deref()),
+        None => {
+            let prefix = format!("{name}: ");
+            summary.strip_prefix(&prefix).unwrap_or(&summary).to_string()
+        }
+    };
+    let diff = tool.as_ref().and_then(|t| t.diff.clone());
+    let has_diff = diff.is_some();
+    let expandable = tool.as_ref().is_some_and(|t| t.file.is_some());
+    let expanded = create_rw_signal(false);
+
+    let dim = move |s: Style| s.color(config.get().color(LapceColor::EDITOR_DIM));
+    let row = stack((
+        svg(move || config.get().ui_svg(icon)).style(move |s| {
+            let config = config.get();
+            let size = config.ui.icon_size() as f32;
+            s.size(size, size)
+                .min_width(size)
+                .color(config.color(LapceColor::EDITOR_DIM))
+        }),
+        label(move || name.clone()).style(|s| s.font_bold()),
+        label(move || detail.clone()).style(move |s| {
+            dim(s)
+                .text_ellipsis()
+                .flex_grow(1.0f32)
+                .flex_basis(0.0)
+                .min_width(0.0)
+        }),
+        label(move || match status.get() {
+            ToolStatus::Running => "…",
+            ToolStatus::Done => "✓",
+            ToolStatus::Failed => "✗",
+        })
+        .style(move |s| {
+            let config = config.get();
+            let color = match status.get() {
+                ToolStatus::Running => LapceColor::EDITOR_DIM,
+                ToolStatus::Done => LapceColor::SOURCE_CONTROL_ADDED,
+                ToolStatus::Failed => LapceColor::LAPCE_ERROR,
+            };
+            s.color(config.color(color))
+        }),
+        label(move || if expanded.get() { "▾" } else { "▸" })
+            .style(move |s| dim(s).apply_if(!expandable, |s| s.hide())),
+    ))
+    .on_click_stop(move |_| {
+        if expandable {
+            expanded.update(|expanded| *expanded = !*expanded);
+        }
+    })
+    .style(move |s| {
+        s.width_full()
+            .items_center()
+            .gap(6.0)
+            .apply_if(expandable, |s| s.cursor(CursorStyle::Pointer))
+            .selectable(false)
+    });
+
+    let details = stack((
+        rich_text(move || {
+            diff_layout(diff.as_deref().unwrap_or_default(), &config.get())
+        })
+        .style(move |s| {
+            s.width_full().margin_top(4.0).apply_if(!has_diff, |s| s.hide())
+        }),
+        tool_actions(tool, internal_command, config),
+    ))
+    .style(move |s| {
+        s.flex_col().width_full().apply_if(!expanded.get(), |s| s.hide())
+    });
+
+    stack((row, details)).style(move |s| {
         let config = config.get();
-        let user_bg = config.color(LapceColor::PANEL_CURRENT_BACKGROUND);
         s.flex_col()
             .width_full()
-            .apply_if(role == ChatRole::User, |s| {
-                s.padding(8.0).border_radius(6.0).background(user_bg)
-            })
-            .apply_if(role == ChatRole::Tool, |s| {
-                s.padding_left(8.0)
-                    .border_left(2.0)
-                    .border_color(config.color(LapceColor::LAPCE_BORDER))
-            })
-            .apply_if(role == ChatRole::Error, |s| {
-                s.padding_left(8.0)
-                    .border_left(2.0)
-                    .border_color(config.color(LapceColor::LAPCE_ERROR))
-            })
+            .padding_horiz(8.0)
+            .padding_vert(4.0)
+            .border(1.0)
+            .border_radius(6.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
     })
+}
+
+/// Workspace-relative path when the file is inside the workspace
+fn display_path(file: &Path, workspace: Option<&Path>) -> String {
+    workspace
+        .and_then(|root| file.strip_prefix(root).ok())
+        .unwrap_or(file)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// "Open" and "Changes" buttons for tool calls that touch a file
@@ -559,5 +790,5 @@ fn tool_actions(
         open,
         container(changes).style(move |s| s.apply_if(!edits_file, |s| s.hide())),
     ))
-    .style(move |s| s.gap(4.0).margin_top(2.0).apply_if(!has_file, |s| s.hide()))
+    .style(move |s| s.gap(4.0).margin_top(4.0).apply_if(!has_file, |s| s.hide()))
 }
