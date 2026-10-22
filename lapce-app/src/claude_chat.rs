@@ -44,7 +44,21 @@ pub struct ChatMessage {
     pub id: u64,
     pub role: ChatRole,
     pub text: RwSignal<String>,
+    pub tool: Option<ToolCall>,
 }
+
+/// What a tool message can show beyond its one line summary
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolCall {
+    pub file: Option<PathBuf>,
+    /// Edit, Write and friends, the file has changes worth reviewing
+    pub edits_file: bool,
+    /// Unified-diff style preview of the change
+    pub diff: Option<String>,
+}
+
+/// A message read back from a session file
+type HistoryItem = (ChatRole, String, Option<ToolCall>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
@@ -355,8 +369,8 @@ impl ClaudeChatData {
         let send = create_ext_action(self.scope, move |history: Vec<_>| {
             // Ignore if another session was picked while loading
             if chat.session_id.get_untracked().as_deref() == Some(&current) {
-                for (role, text) in history {
-                    chat.push(role, text);
+                for (role, text, tool) in history {
+                    chat.push_message(role, text, tool);
                 }
             }
         });
@@ -500,7 +514,11 @@ impl ClaudeChatData {
                 let blocks = event["message"]["content"].as_array();
                 for block in blocks.into_iter().flatten() {
                     if block["type"] == "tool_use" {
-                        self.push(ChatRole::Tool, tool_summary(block));
+                        self.push_message(
+                            ChatRole::Tool,
+                            tool_summary(block),
+                            Some(tool_call(block)),
+                        );
                     }
                 }
             }
@@ -527,10 +545,19 @@ impl ClaudeChatData {
     }
 
     fn push(&self, role: ChatRole, text: String) {
+        self.push_message(role, text, None);
+    }
+
+    fn push_message(&self, role: ChatRole, text: String, tool: Option<ToolCall>) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let text = self.scope.create_rw_signal(text);
-        let msg = ChatMessage { id, role, text };
+        let msg = ChatMessage {
+            id,
+            role,
+            text,
+            tool,
+        };
         self.messages.update(|messages| messages.push_back(msg));
     }
 
@@ -607,7 +634,7 @@ fn session_title(reader: impl BufRead) -> Option<String> {
 }
 
 /// Rebuild the visible chat from a session file
-fn read_history(reader: impl BufRead) -> Vec<(ChatRole, String)> {
+fn read_history(reader: impl BufRead) -> Vec<HistoryItem> {
     let mut history = Vec::new();
     for line in reader.lines() {
         let Ok(line) = line else { break };
@@ -625,7 +652,7 @@ fn read_history(reader: impl BufRead) -> Vec<(ChatRole, String)> {
                 if let Some(text) = content.as_str()
                     && !text.starts_with('<')
                 {
-                    history.push((ChatRole::User, text.to_string()));
+                    history.push((ChatRole::User, text.to_string(), None));
                 }
             }
             Some("assistant") => {
@@ -633,10 +660,13 @@ fn read_history(reader: impl BufRead) -> Vec<(ChatRole, String)> {
                     match block["type"].as_str() {
                         Some("text") => {
                             let text = block["text"].as_str().unwrap_or_default();
-                            history.push((ChatRole::Assistant, text.to_string()));
+                            let text = text.to_string();
+                            history.push((ChatRole::Assistant, text, None));
                         }
                         Some("tool_use") => {
-                            history.push((ChatRole::Tool, tool_summary(block)));
+                            let summary = tool_summary(block);
+                            let tool = Some(tool_call(block));
+                            history.push((ChatRole::Tool, summary, tool));
                         }
                         _ => {}
                     }
@@ -741,6 +771,57 @@ fn permission_response(
     })
 }
 
+/// File and change preview of a tool call
+fn tool_call(block: &Value) -> ToolCall {
+    let name = block["name"].as_str().unwrap_or_default();
+    let input = &block["input"];
+    let file = input["file_path"]
+        .as_str()
+        .or(input["notebook_path"].as_str())
+        .map(PathBuf::from);
+    let diff_lines = |edit: &Value| {
+        let old = edit["old_string"].as_str().unwrap_or_default().lines();
+        let new = edit["new_string"].as_str().unwrap_or_default().lines();
+        let old = old.map(|l| format!("-{l}"));
+        old.chain(new.map(|l| format!("+{l}"))).collect::<Vec<_>>()
+    };
+    let lines = match name {
+        "Edit" => Some(diff_lines(input)),
+        "MultiEdit" => Some(
+            input["edits"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(diff_lines)
+                .collect(),
+        ),
+        "Write" => Some(
+            input["content"]
+                .as_str()
+                .unwrap_or_default()
+                .lines()
+                .map(|l| format!("+{l}"))
+                .collect(),
+        ),
+        _ => None,
+    };
+    let diff = lines.filter(|l| !l.is_empty()).map(|mut lines| {
+        // ponytail: fixed cap, long edits are reviewed via "Changes"
+        const MAX: usize = 30;
+        if lines.len() > MAX {
+            let more = lines.len() - MAX;
+            lines.truncate(MAX);
+            lines.push(format!("… {more} more lines"));
+        }
+        lines.join("\n")
+    });
+    ToolCall {
+        file,
+        edits_file: matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit"),
+        diff,
+    }
+}
+
 /// One line describing a tool call, e.g. "Bash: cargo test"
 fn tool_summary(block: &Value) -> String {
     let name = block["name"].as_str().unwrap_or("Tool");
@@ -765,7 +846,7 @@ mod tests {
     use super::{
         ChatRole, PermissionDecision, SlashCommand, filter_commands, parse_commands,
         parse_permission, permission_response, project_dir_name, read_history,
-        session_title, tool_summary,
+        session_title, tool_call, tool_summary,
     };
 
     #[test]
@@ -841,6 +922,31 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_previews_edits() {
+        let edit = json!({"name": "Edit", "input": {
+            "file_path": "/w/a.rs", "old_string": "a\nb", "new_string": "c",
+        }});
+        let call = tool_call(&edit);
+        assert_eq!(call.file, Some("/w/a.rs".into()));
+        assert!(call.edits_file);
+        assert_eq!(call.diff.as_deref(), Some("-a\n-b\n+c"));
+
+        let content = "x\n".repeat(40);
+        let write = json!({"name": "Write", "input": {
+            "file_path": "/w/b.rs", "content": content,
+        }});
+        let diff = tool_call(&write).diff.unwrap();
+        assert_eq!(diff.lines().count(), 31);
+        assert!(diff.ends_with("… 10 more lines"));
+
+        let read = json!({"name": "Read", "input": {"file_path": "/w/a.rs"}});
+        let call = tool_call(&read);
+        assert!(!call.edits_file);
+        assert!(call.diff.is_none());
+        assert!(call.file.is_some());
+    }
+
+    #[test]
     fn project_dir_name_matches_claude_code() {
         let path = std::path::Path::new("/Users/me/my_app.v2");
         assert_eq!(project_dir_name(path), "-Users-me-my-app-v2");
@@ -878,8 +984,10 @@ mod tests {
         .map(|v| v.to_string())
         .join("\n");
         let history = read_history(file.as_bytes());
-        let roles: Vec<_> = history.iter().map(|(r, _)| *r).collect();
+        let roles: Vec<_> = history.iter().map(|(r, _, _)| *r).collect();
         assert_eq!(roles, [ChatRole::User, ChatRole::Assistant, ChatRole::Tool]);
         assert_eq!(history[2].1, "Bash: ls");
+        assert!(history[0].2.is_none());
+        assert_eq!(history[2].2.as_ref().unwrap().file, None);
     }
 }

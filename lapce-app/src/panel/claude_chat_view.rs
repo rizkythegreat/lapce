@@ -24,10 +24,12 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, PermissionDecision, PermissionRequest,
-        SessionInfo, SlashCommand,
+        SessionInfo, SlashCommand, ToolCall,
     },
+    command::InternalCommand,
     config::{LapceConfig, color::LapceColor},
     doc::relative_time,
+    listener::Listener,
     markdown::{MarkdownContent, parse_markdown},
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
@@ -43,6 +45,7 @@ pub fn claude_chat_panel(
     let messages = chat.messages;
     let busy = chat.busy;
     let show_sessions = chat.show_sessions;
+    let internal_command = chat.common.internal_command;
     let is_focused = move || focus.get() == Focus::Panel(PanelKind::ClaudeChat);
     let content_height = create_rw_signal(0.0);
     // Scroll content is unbounded, give it the visible width so text wraps
@@ -68,7 +71,7 @@ pub fn claude_chat_panel(
                 dyn_stack(
                     move || messages.get(),
                     |msg| msg.id,
-                    move |msg| message_view(msg, config),
+                    move |msg| message_view(msg, internal_command, config),
                 )
                 .on_resize(move |rect| content_height.set(rect.height()))
                 .style(move |s| {
@@ -425,12 +428,14 @@ fn session_row(
 
 fn message_view(
     msg: ChatMessage,
+    internal_command: Listener<InternalCommand>,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let role = msg.role;
     let text = msg.text;
+    let diff = msg.tool.as_ref().and_then(|tool| tool.diff.clone());
     let id = AtomicU64::new(0);
-    dyn_stack(
+    let content = dyn_stack(
         move || {
             let config = config.get();
             text.with(|text| match role {
@@ -439,7 +444,13 @@ fn message_view(
                 }
                 ChatRole::Tool => {
                     let color = config.color(LapceColor::EDITOR_DIM);
-                    vec![MarkdownContent::Text(plain_text(text, color, &config))]
+                    let summary = plain_text(text, color, &config);
+                    let mut content = vec![MarkdownContent::Text(summary)];
+                    if let Some(diff) = diff.as_ref() {
+                        let diff = format!("````diff\n{diff}\n````");
+                        content.extend(parse_markdown(&diff, 1.5, &config));
+                    }
+                    content
                 }
                 ChatRole::Error => {
                     let color = config.color(LapceColor::LAPCE_ERROR);
@@ -455,7 +466,7 @@ fn message_view(
                         .style(|s| s.width_full()),
                 )
                 .style(|s| s.width_full())
-                    .into_any()
+                .into_any()
             }
             MarkdownContent::Image { .. } => empty().into_any(),
             MarkdownContent::Separator => empty()
@@ -468,14 +479,16 @@ fn message_view(
                 .into_any(),
         },
     )
-    .style(move |s| {
+    .style(|s| s.flex_col().width_full());
+
+    let actions = tool_actions(msg.tool, internal_command, config);
+    stack((content, actions)).style(move |s| {
         let config = config.get();
+        let user_bg = config.color(LapceColor::PANEL_CURRENT_BACKGROUND);
         s.flex_col()
             .width_full()
             .apply_if(role == ChatRole::User, |s| {
-                s.padding(8.0)
-                    .border_radius(6.0)
-                    .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+                s.padding(8.0).border_radius(6.0).background(user_bg)
             })
             .apply_if(role == ChatRole::Tool, |s| {
                 s.padding_left(8.0)
@@ -488,4 +501,42 @@ fn message_view(
                     .border_color(config.color(LapceColor::LAPCE_ERROR))
             })
     })
+}
+
+/// "Open" and "Changes" buttons for tool calls that touch a file
+fn tool_actions(
+    tool: Option<ToolCall>,
+    internal_command: Listener<InternalCommand>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let file = tool.as_ref().and_then(|tool| tool.file.clone());
+    let edits_file = tool.as_ref().is_some_and(|tool| tool.edits_file);
+    let has_file = file.is_some();
+    let open = {
+        let file = file.clone();
+        text_button(
+            || "Open",
+            move || {
+                if let Some(path) = file.clone() {
+                    internal_command.send(InternalCommand::OpenFile { path });
+                }
+            },
+            config,
+        )
+    };
+    // Same diff against HEAD as the source control panel
+    let changes = text_button(
+        || "Changes",
+        move || {
+            if let Some(path) = file.clone() {
+                internal_command.send(InternalCommand::OpenFileChanges { path });
+            }
+        },
+        config,
+    );
+    stack((
+        open,
+        container(changes).style(move |s| s.apply_if(!edits_file, |s| s.hide())),
+    ))
+    .style(move |s| s.gap(4.0).margin_top(2.0).apply_if(!has_file, |s| s.hide()))
 }
