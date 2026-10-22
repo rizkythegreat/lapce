@@ -249,7 +249,7 @@ impl LapceConfig {
             .unwrap()
     }
 
-    fn default_lapce_config() -> LapceConfig {
+    pub(crate) fn default_lapce_config() -> LapceConfig {
         let mut default_lapce_config: LapceConfig =
             DEFAULT_CONFIG.clone().try_deserialize().expect("Failed to deserialize default config, this likely indicates a missing or misnamed field in settings.toml");
         default_lapce_config.color_theme = DEFAULT_DARK_THEME_COLOR_CONFIG.clone();

@@ -48,20 +48,48 @@ pub fn parse_markdown(
             | Options::ENABLE_HEADING_ATTRIBUTES,
     );
     let mut last_text = CowStr::from("");
-    // Whether we should add a newline on the next entry
-    // This is used so that we don't emit newlines at the very end of the generation
-    let mut add_newline = false;
+    // Line breaks owed to the next entry, 2 leaves a blank line between blocks.
+    // Deferred so that we don't emit newlines at the very end of the generation
+    let mut add_newlines = 0;
+    // Next number of each open list, None for bullet lists
+    let mut lists: SmallVec<[Option<u64>; 4]> = SmallVec::new();
     for event in parser {
-        // Add the newline since we're going to be outputting more
-        if add_newline {
+        // Add the newlines since we're going to be outputting more. Code blocks
+        // already end with one, count it.
+        let trailing =
+            current_text.len() - current_text.trim_end_matches('\n').len();
+        for _ in trailing..add_newlines {
             current_text.push('\n');
             builder_dirty = true;
             pos += 1;
-            add_newline = false;
         }
+        add_newlines = 0;
 
         match event {
             Event::Start(tag) => {
+                match &tag {
+                    Tag::List(start) => lists.push(*start),
+                    Tag::Item => {
+                        // A nested list starts right after its parent item's text
+                        if !current_text.is_empty() && !current_text.ends_with('\n')
+                        {
+                            current_text.push('\n');
+                            pos += 1;
+                        }
+                        let indent = "    ".repeat(lists.len().saturating_sub(1));
+                        let marker = match lists.last_mut() {
+                            Some(Some(n)) => {
+                                *n += 1;
+                                format!("{indent}{}. ", *n - 1)
+                            }
+                            _ => format!("{indent}• "),
+                        };
+                        current_text.push_str(&marker);
+                        pos += marker.len();
+                        builder_dirty = true;
+                    }
+                    _ => {}
+                }
                 tag_stack.push((pos, tag));
             }
             Event::End(end_tag) => {
@@ -81,9 +109,13 @@ pub fn parse_markdown(
                             .add_span(start_offset..pos.max(start_offset), attrs);
                     }
 
-                    if should_add_newline_after_tag(&tag) {
-                        add_newline = true;
+                    if matches!(tag, Tag::List(_)) {
+                        lists.pop();
                     }
+                    let in_item =
+                        tag_stack.iter().any(|(_, tag)| matches!(tag, Tag::Item));
+                    add_newlines =
+                        add_newlines.max(newlines_after_tag(&tag, in_item));
 
                     match &tag {
                         Tag::CodeBlock(kind) => {
@@ -183,7 +215,12 @@ pub fn parse_markdown(
             }
             Event::Rule => {}
             Event::FootnoteReference(_text) => {}
-            Event::TaskListMarker(_text) => {}
+            Event::TaskListMarker(checked) => {
+                let marker = if checked { "[x] " } else { "[ ] " };
+                current_text.push_str(marker);
+                pos += marker.len();
+                builder_dirty = true;
+            }
             Event::InlineHtml(_) => {} // TODO(panekj): Implement
             Event::InlineMath(_) => {} // TODO(panekj): Implement
             Event::DisplayMath(_) => {} // TODO(panekj): Implement
@@ -253,12 +290,23 @@ fn attribute_for_tag<'a>(
     }
 }
 
-/// Decides whether newlines should be added after a specific markdown tag
-fn should_add_newline_after_tag(tag: &Tag) -> bool {
-    !matches!(
-        tag,
-        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. }
-    )
+/// Line breaks after a specific markdown tag: none inline, a blank line after
+/// blocks, a single break between list items and inside them
+fn newlines_after_tag(tag: &Tag, in_item: bool) -> usize {
+    match tag {
+        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } => 0,
+        Tag::Paragraph
+        | Tag::Heading { .. }
+        | Tag::CodeBlock(_)
+        | Tag::List(_)
+        | Tag::BlockQuote(_)
+        | Tag::Table(_)
+            if !in_item =>
+        {
+            2
+        }
+        _ => 1,
+    }
 }
 
 /// Whether it should skip the text node after a specific tag  
@@ -341,4 +389,37 @@ pub fn from_plaintext(
         None,
     );
     vec![MarkdownContent::Text(text_layout)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MarkdownContent, parse_markdown};
+    use crate::config::LapceConfig;
+
+    fn rendered(markdown: &str) -> String {
+        let config = LapceConfig::default_lapce_config();
+        parse_markdown(markdown, 1.5, &config)
+            .into_iter()
+            .filter_map(|content| match content {
+                MarkdownContent::Text(layout) => Some(
+                    layout
+                        .lines()
+                        .iter()
+                        .map(|line| line.text())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blocks_and_lists() {
+        assert_eq!(rendered("a\n\nb"), "a\n\nb");
+        assert_eq!(rendered("- x\n- y\n\nz"), "• x\n• y\n\nz");
+        assert_eq!(rendered("3. x\n4. y"), "3. x\n4. y");
+        assert_eq!(rendered("- x\n  - y\n- z"), "• x\n    • y\n• z");
+        assert_eq!(rendered("- [x] done"), "• [x] done");
+    }
 }
