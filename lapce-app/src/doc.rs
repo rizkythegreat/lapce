@@ -60,7 +60,7 @@ use lapce_rpc::{
     buffer::BufferId,
     plugin::PluginId,
     proxy::ProxyResponse,
-    source_control::BlameHunk,
+    source_control::{BlameCommit, BlameHunk},
     style::{LineStyle, LineStyles, Style},
 };
 use lapce_xi_rope::{
@@ -1458,8 +1458,9 @@ impl Doc {
         }
     }
 
-    /// Inline blame text for `line`, if the blame is still valid for the buffer
-    fn blame_text(&self, line: usize) -> Option<String> {
+    /// Commit of `line`, None inside when it is not committed yet. None when
+    /// the blame is missing or stale for the buffer.
+    fn blame_commit(&self, line: usize) -> Option<Option<BlameCommit>> {
         let rev = self.rev();
         self.blame.with_untracked(|blame| {
             let (blame_rev, hunks) = blame.as_ref()?;
@@ -1469,15 +1470,46 @@ impl Doc {
             let hunk = hunks.iter().find(|h| {
                 line >= h.start_line && line < h.start_line + h.lines
             })?;
-            Some(match &hunk.commit {
-                Some(c) => format!(
-                    "    {}, {} • {}",
-                    c.author,
-                    relative_time(chrono::Utc::now().timestamp() - c.time),
-                    c.summary
-                ),
-                None => "    Uncommitted changes".to_string(),
-            })
+            Some(hunk.commit.clone())
+        })
+    }
+
+    /// Inline blame text for `line`, a long summary ends in "…" and the hover
+    /// shows it whole
+    fn blame_text(&self, line: usize) -> Option<String> {
+        Some(match self.blame_commit(line)? {
+            Some(c) => format!(
+                "    {}, {} • {}",
+                c.author,
+                relative_time(chrono::Utc::now().timestamp() - c.time),
+                truncate_chars(&c.summary, BLAME_SUMMARY_CHARS)
+            ),
+            None => "    Uncommitted changes".to_string(),
+        })
+    }
+
+    /// Whether `line` shows the inline blame right now
+    pub fn shows_blame(&self, line: usize) -> bool {
+        self.common.config.get_untracked().editor.enable_inline_blame
+            && self.blame_line.get_untracked() == Some(line)
+            && self.blame_commit(line).is_some()
+    }
+
+    /// Markdown with the whole commit of `line`, for hovering its blame
+    pub fn blame_hover(&self, line: usize) -> Option<String> {
+        Some(match self.blame_commit(line)? {
+            Some(c) => {
+                let date = chrono::DateTime::from_timestamp(c.time, 0)
+                    .map(|t| t.with_timezone(&chrono::Local))
+                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_default();
+                let ago = relative_time(chrono::Utc::now().timestamp() - c.time);
+                let id: String = c.id.chars().take(8).collect();
+                let author = c.author;
+                let summary = c.summary;
+                format!("**{author}** · {ago} ({date})\n\n{summary}\n\n`{id}`")
+            }
+            None => "Uncommitted changes".to_string(),
         })
     }
 
@@ -2470,6 +2502,19 @@ fn extra_styles_for_range(
         })
 }
 
+/// Inline blame summaries stop here, the hover shows the rest
+const BLAME_SUMMARY_CHARS: usize = 50;
+
+/// `text` cut to `max` characters, the last one an ellipsis when cut
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
 /// "3 days ago" style age for a duration in seconds
 pub(crate) fn relative_time(secs: i64) -> String {
     let (n, unit) = match secs {
@@ -2485,7 +2530,15 @@ pub(crate) fn relative_time(secs: i64) -> String {
 
 #[cfg(test)]
 mod blame_tests {
-    use super::relative_time;
+    use super::{relative_time, truncate_chars};
+
+    #[test]
+    fn truncate_long_summary() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdefghij", 10), "abcdefghij");
+        assert_eq!(truncate_chars("abcdefghijk", 10), "abcdefghi…");
+        assert_eq!(truncate_chars("ééééé", 3), "éé…");
+    }
 
     #[test]
     fn relative_time_units() {

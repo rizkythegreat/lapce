@@ -2854,12 +2854,14 @@ impl EditorData {
         }
         let hover_delay = self.common.config.get_untracked().editor.hover_delay;
         if hover_delay > 0 {
-            if is_inside {
-                let start_offset = self
-                    .doc()
-                    .buffer
-                    .with_untracked(|buffer| buffer.prev_code_boundary(offset));
-
+            let doc = self.doc();
+            let (start_offset, line) = doc.buffer.with_untracked(|buffer| {
+                (buffer.prev_code_boundary(offset), buffer.line_of_offset(offset))
+            });
+            // Past the end of the cursor line sits the inline blame, hovering
+            // it shows the whole commit
+            let blame = !is_inside && doc.shows_blame(line);
+            if is_inside || blame {
                 let editor = self.clone();
                 let mouse_hover_timer = self.common.mouse_hover_timer;
                 let timer_token =
@@ -2867,7 +2869,11 @@ impl EditorData {
                         if mouse_hover_timer.try_get_untracked() == Some(token)
                             && editor.editor_tab_id.try_get_untracked().is_some()
                         {
-                            editor.update_hover(start_offset);
+                            if blame {
+                                editor.show_blame_hover(start_offset, line);
+                            } else {
+                                editor.update_hover(start_offset);
+                            }
                         }
                     });
                 mouse_hover_timer.set(timer_token);
@@ -3010,6 +3016,19 @@ impl EditorData {
             }
         }
         show_context_menu(menu, None);
+    }
+
+    /// The whole commit of the inline blame on `line`, anchored at `offset`
+    fn show_blame_hover(&self, offset: usize, line: usize) {
+        let Some(text) = self.doc().blame_hover(line) else {
+            return;
+        };
+        let config = self.common.config.get_untracked();
+        let hover = &self.common.hover;
+        hover.content.set(parse_markdown(&text, 1.8, &config));
+        hover.offset.set(offset);
+        hover.editor_id.set(self.id());
+        hover.active.set(true);
     }
 
     #[instrument]
