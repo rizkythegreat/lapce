@@ -14,7 +14,13 @@ use floem::{
     keyboard::Modifiers,
     reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
 };
-use lapce_core::{command::EditCommand, directory::Directory, mode::Mode};
+use lapce_core::{
+    command::{EditCommand, FocusCommand},
+    directory::Directory,
+    mode::Mode,
+    selection::Selection,
+};
+use lapce_xi_rope::Rope;
 use serde_json::{Value, json};
 
 use crate::{
@@ -38,6 +44,13 @@ pub struct ChatMessage {
     pub id: u64,
     pub role: ChatRole,
     pub text: RwSignal<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+    pub name: String,
+    pub description: String,
+    pub hint: String,
 }
 
 #[derive(Clone, Debug)]
@@ -65,6 +78,11 @@ pub struct ClaudeChatData {
     pub session_id: RwSignal<Option<String>>,
     pub sessions: RwSignal<Vec<SessionInfo>>,
     pub show_sessions: RwSignal<bool>,
+    /// Slash commands reported by Claude Code, kept across processes
+    pub commands: RwSignal<Vec<SlashCommand>>,
+    /// Highlighted row of the slash command popup
+    pub command_index: RwSignal<usize>,
+    commands_requested: Rc<Cell<bool>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -79,7 +97,12 @@ impl KeyPressFocus for ClaudeChatData {
     }
 
     fn check_condition(&self, condition: Condition) -> bool {
-        matches!(condition, Condition::PanelFocus)
+        match condition {
+            Condition::PanelFocus => true,
+            // Lets up/down/enter drive the slash command popup
+            Condition::ListFocus => !self.command_matches().is_empty(),
+            _ => false,
+        }
     }
 
     fn run_command(
@@ -89,6 +112,18 @@ impl KeyPressFocus for ClaudeChatData {
         mods: Modifiers,
     ) -> CommandExecuted {
         match &command.kind {
+            CommandKind::Focus(FocusCommand::ListNext) => {
+                self.move_command_index(1);
+                CommandExecuted::Yes
+            }
+            CommandKind::Focus(FocusCommand::ListPrevious) => {
+                self.move_command_index(-1);
+                CommandExecuted::Yes
+            }
+            CommandKind::Focus(FocusCommand::ListSelect) => {
+                self.select_command();
+                CommandExecuted::Yes
+            }
             CommandKind::Edit(EditCommand::InsertNewLine) => {
                 self.send();
                 CommandExecuted::Yes
@@ -118,6 +153,9 @@ impl ClaudeChatData {
             session_id: cx.create_rw_signal(None),
             sessions: cx.create_rw_signal(Vec::new()),
             show_sessions: cx.create_rw_signal(false),
+            commands: cx.create_rw_signal(Vec::new()),
+            command_index: cx.create_rw_signal(0),
+            commands_requested: Rc::new(Cell::new(false)),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -150,6 +188,7 @@ impl ClaudeChatData {
             return;
         }
         self.editor.reset();
+        self.command_index.set(0);
         self.push(ChatRole::User, text.to_string());
 
         let running = self.process.borrow().is_some();
@@ -162,16 +201,12 @@ impl ClaudeChatData {
             "type": "user",
             "message": { "role": "user", "content": text },
         });
-        let written = self.process.borrow_mut().as_mut().map(|p| {
-            writeln!(p.stdin, "{line}").and_then(|_| p.stdin.flush())
-        });
-        match written {
-            Some(Ok(())) => self.busy.set(true),
-            Some(Err(e)) => {
+        match self.write_line(&line) {
+            Ok(()) => self.busy.set(true),
+            Err(e) => {
                 self.stop();
                 self.push(ChatRole::Error, format!("Failed to send: {e}"));
             }
-            None => {}
         }
     }
 
@@ -183,6 +218,68 @@ impl ClaudeChatData {
             let _ = p.child.wait();
         }
         self.busy.set(false);
+    }
+
+    /// Slash commands matching the input, tracked
+    pub fn command_matches(&self) -> Vec<SlashCommand> {
+        let input = self.editor.doc_signal().get().buffer.with(|b| b.to_string());
+        self.commands.with(|commands| filter_commands(commands, &input))
+    }
+
+    /// Start Claude Code early so it can report its slash commands. Starting
+    /// the process alone makes no API request.
+    pub fn request_commands(&self) {
+        if self.commands_requested.replace(true) {
+            return;
+        }
+        let running = self.process.borrow().is_some();
+        if !running && let Err(e) = self.spawn() {
+            self.push(ChatRole::Error, format!("Failed to start claude: {e}"));
+        }
+    }
+
+    pub fn complete_command(&self, name: &str) {
+        let text = format!("/{name} ");
+        let len = text.len();
+        self.editor.doc().reload(Rope::from(text), true);
+        self.editor
+            .cursor()
+            .update(|cursor| cursor.set_insert(Selection::caret(len)));
+        self.command_index.set(0);
+    }
+
+    fn select_command(&self) {
+        let matches = self.command_matches();
+        let index = self.command_index.get_untracked();
+        let Some(command) = matches.get(index).or(matches.last()) else {
+            return;
+        };
+        let input = self.editor.doc().buffer.with_untracked(|b| b.to_string());
+        // Enter on a fully typed command runs it
+        if input.trim() == format!("/{}", command.name) {
+            self.send();
+        } else {
+            self.complete_command(&command.name);
+        }
+    }
+
+    fn move_command_index(&self, delta: isize) {
+        let len = self.command_matches().len();
+        if len == 0 {
+            return;
+        }
+        self.command_index.update(|index| {
+            *index = (*index as isize + delta).rem_euclid(len as isize) as usize;
+        });
+    }
+
+    fn write_line(&self, line: &Value) -> std::io::Result<()> {
+        let mut process = self.process.borrow_mut();
+        let Some(p) = process.as_mut() else {
+            return Err(std::io::ErrorKind::NotConnected.into());
+        };
+        writeln!(p.stdin, "{line}")?;
+        p.stdin.flush()
     }
 
     pub fn new_session(&self) {
@@ -301,7 +398,12 @@ impl ClaudeChatData {
         });
 
         *self.process.borrow_mut() = Some(ChatProcess { child, stdin });
-        Ok(())
+        // Ask for the slash commands, answered without an API request
+        self.write_line(&json!({
+            "type": "control_request",
+            "request_id": "lapce-initialize",
+            "request": { "subtype": "initialize" },
+        }))
     }
 
     fn handle_event(&self, event: &Value) {
@@ -313,6 +415,17 @@ impl ClaudeChatData {
             Some("system") if event["subtype"] == "init" => {
                 if let Some(id) = event["session_id"].as_str() {
                     self.session_id.set(Some(id.to_string()));
+                }
+            }
+            Some("system") if event["subtype"] == "commands_changed" => {
+                if let Some(commands) = parse_commands(&event["commands"]) {
+                    self.commands.set(commands);
+                }
+            }
+            Some("control_response") => {
+                let commands = &event["response"]["response"]["commands"];
+                if let Some(commands) = parse_commands(commands) {
+                    self.commands.set(commands);
                 }
             }
             Some("stream_event") => {
@@ -485,6 +598,43 @@ fn read_history(reader: impl BufRead) -> Vec<(ChatRole, String)> {
     history
 }
 
+fn parse_commands(commands: &Value) -> Option<Vec<SlashCommand>> {
+    let commands = commands.as_array()?;
+    let field =
+        |c: &Value, key: &str| c[key].as_str().unwrap_or_default().to_string();
+    Some(
+        commands
+            .iter()
+            .filter(|c| c["name"].is_string())
+            .map(|c| SlashCommand {
+                name: field(c, "name"),
+                description: field(c, "description"),
+                hint: field(c, "argumentHint"),
+            })
+            .collect(),
+    )
+}
+
+/// Commands for the popup while the input is `/` plus a partial name.
+/// Name prefix matches come first, then other substring matches.
+fn filter_commands(commands: &[SlashCommand], input: &str) -> Vec<SlashCommand> {
+    let Some(query) = input.strip_prefix('/') else {
+        return Vec::new();
+    };
+    if query.contains(char::is_whitespace) {
+        return Vec::new();
+    }
+    let query = query.to_lowercase();
+    let (mut prefix, rest): (Vec<_>, Vec<_>) = commands
+        .iter()
+        .filter(|c| c.name.to_lowercase().contains(&query))
+        .cloned()
+        .partition(|c| c.name.to_lowercase().starts_with(&query));
+    prefix.extend(rest);
+    prefix.truncate(8);
+    prefix
+}
+
 /// One line describing a tool call, e.g. "Bash: cargo test"
 fn tool_summary(block: &Value) -> String {
     let name = block["name"].as_str().unwrap_or("Tool");
@@ -507,7 +657,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRole, project_dir_name, read_history, session_title, tool_summary,
+        ChatRole, SlashCommand, filter_commands, parse_commands, project_dir_name,
+        read_history, session_title, tool_summary,
     };
 
     #[test]
@@ -518,6 +669,30 @@ mod tests {
         assert_eq!(tool_summary(&read), "Read: /a.rs");
         let other = json!({"name": "TodoWrite", "input": {"todos": []}});
         assert_eq!(tool_summary(&other), "TodoWrite");
+    }
+
+    #[test]
+    fn commands_filter_by_prefix_then_substring() {
+        let commands = parse_commands(&json!([
+            {"name": "review", "description": "Review", "argumentHint": "[pr]"},
+            {"name": "compact", "description": "Compact"},
+            {"name": "caveman:caveman-review"},
+            {"description": "no name"},
+        ]))
+        .unwrap();
+        assert_eq!(commands.len(), 3);
+        assert_eq!(commands[0].hint, "[pr]");
+
+        let names = |input: &str| -> Vec<String> {
+            filter_commands(&commands, input)
+                .into_iter()
+                .map(|c: SlashCommand| c.name)
+                .collect()
+        };
+        assert_eq!(names("/rev"), ["review", "caveman:caveman-review"]);
+        assert_eq!(names("/"), ["review", "compact", "caveman:caveman-review"]);
+        assert!(names("/review now").is_empty());
+        assert!(names("review").is_empty());
     }
 
     #[test]

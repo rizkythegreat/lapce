@@ -8,8 +8,11 @@ use floem::{
     IntoView, View,
     event::EventListener,
     kurbo::Rect,
-    reactive::{ReadSignal, SignalGet, SignalUpdate, SignalWith, create_rw_signal},
-    style::CursorStyle,
+    reactive::{
+        ReadSignal, SignalGet, SignalUpdate, SignalWith, create_effect, create_memo,
+        create_rw_signal,
+    },
+    style::{CursorStyle, Style},
     views::{
         Decorators, container, dyn_stack, empty, label, rich_text, scroll, stack,
     },
@@ -17,7 +20,9 @@ use floem::{
 
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
-    claude_chat::{ChatMessage, ChatRole, ClaudeChatData, SessionInfo},
+    claude_chat::{
+        ChatMessage, ChatRole, ClaudeChatData, SessionInfo, SlashCommand,
+    },
     config::{LapceConfig, color::LapceColor},
     doc::relative_time,
     markdown::{MarkdownContent, from_plaintext, parse_markdown},
@@ -37,6 +42,18 @@ pub fn claude_chat_panel(
     let show_sessions = chat.show_sessions;
     let is_focused = move || focus.get() == Focus::Panel(PanelKind::ClaudeChat);
     let content_height = create_rw_signal(0.0);
+
+    {
+        let chat = chat.clone();
+        create_effect(move |_| {
+            let doc = chat.editor.doc_signal().get();
+            let slash = doc.buffer.with(|b| b.to_string().starts_with('/'));
+            chat.command_index.set(0);
+            if slash && chat.commands.with_untracked(|c| c.is_empty()) {
+                chat.request_commands();
+            }
+        });
+    }
 
     stack((
         header(chat.clone(), config),
@@ -69,6 +86,7 @@ pub fn claude_chat_panel(
                 .color(config.get().color(LapceColor::EDITOR_DIM))
                 .apply_if(!busy.get(), |s| s.hide())
         }),
+        command_popup(chat.clone(), config),
         stack((
             TextInputBuilder::new()
                 .is_focused(is_focused)
@@ -162,6 +180,81 @@ fn text_button(
         })
 }
 
+fn command_popup(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let matches = {
+        let chat = chat.clone();
+        create_memo(move |_| chat.command_matches())
+    };
+    dyn_stack(
+        move || matches.get().into_iter().enumerate().collect::<Vec<_>>(),
+        |(i, command)| (*i, command.name.clone()),
+        move |(i, command)| command_row(i, command, chat.clone(), config),
+    )
+    .style(move |s| {
+        s.flex_col()
+            .margin_horiz(10.0)
+            .padding_vert(4.0)
+            .border(1.0)
+            .border_radius(6.0)
+            .border_color(config.get().color(LapceColor::LAPCE_BORDER))
+            .apply_if(matches.with(|m| m.is_empty()), |s| s.hide())
+    })
+}
+
+fn command_row(
+    i: usize,
+    command: SlashCommand,
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let SlashCommand {
+        name,
+        description,
+        hint,
+    } = command;
+    let index = chat.command_index;
+    let focus = chat.common.focus;
+    let dim = move |s: Style| {
+        s.margin_left(8.0).color(config.get().color(LapceColor::EDITOR_DIM))
+    };
+    stack((
+        label({
+            let name = name.clone();
+            move || format!("/{name}")
+        }),
+        label(move || hint.clone()).style(dim),
+        label(move || description.clone()).style(move |s| {
+            dim(s)
+                .text_ellipsis()
+                .flex_grow(1.0f32)
+                .flex_basis(0.0)
+                .min_width(0.0)
+        }),
+    ))
+    .on_click_stop(move |_| {
+        focus.set(Focus::Panel(PanelKind::ClaudeChat));
+        chat.complete_command(&name);
+    })
+    .style(move |s| {
+        let config = config.get();
+        s.width_full()
+            .padding_horiz(8.0)
+            .items_center()
+            .apply_if(index.get() == i, |s| {
+                s.background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+            })
+            .hover(|s| {
+                s.cursor(CursorStyle::Pointer).background(
+                    config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                )
+            })
+            .selectable(false)
+    })
+}
+
 fn sessions_view(
     chat: ClaudeChatData,
     config: ReadSignal<Arc<LapceConfig>>,
@@ -217,8 +310,7 @@ fn session_row(
                 .min_width(0.0)
         }),
         label(move || age.clone()).style(move |s| {
-            s.margin_left(10.0)
-                .color(config.get().color(LapceColor::EDITOR_DIM))
+            s.margin_left(10.0).color(config.get().color(LapceColor::EDITOR_DIM))
         }),
     ))
     .on_click_stop(move |_| chat.resume(id.clone()))
