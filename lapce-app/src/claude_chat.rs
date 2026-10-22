@@ -440,6 +440,18 @@ impl ClaudeChatData {
         self.popup_index.set(0);
     }
 
+    /// Append an `@` mention for a file dropped on the panel
+    pub fn mention_path(&self, path: &Path) {
+        let mention = path_mention(path, self.common.workspace.path.as_deref());
+        let input = self.editor.doc().buffer.with_untracked(|b| b.to_string());
+        let sep = if input.is_empty() || input.ends_with(char::is_whitespace) {
+            ""
+        } else {
+            " "
+        };
+        self.set_input(format!("{input}{sep}{mention} "));
+    }
+
     /// Replace the input and put the cursor at its end
     fn set_input(&self, text: String) {
         let len = text.len();
@@ -952,6 +964,19 @@ fn filter_commands(commands: &[SlashCommand], input: &str) -> Vec<SlashCommand> 
     prefix
 }
 
+/// `@path`, relative inside the workspace, quoted when it has spaces
+fn path_mention(path: &Path, workspace: Option<&Path>) -> String {
+    let path = workspace
+        .and_then(|root| path.strip_prefix(root).ok())
+        .unwrap_or(path)
+        .to_string_lossy();
+    if path.contains(char::is_whitespace) {
+        format!("@\"{path}\"")
+    } else {
+        format!("@{path}")
+    }
+}
+
 /// The `@` mention being typed at the end of the input, without the `@`
 pub fn mention_query(input: &str) -> Option<&str> {
     last_token(input).strip_prefix('@')
@@ -1127,8 +1152,8 @@ mod tests {
     use super::{
         ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
         mention_query, parse_commands, parse_permission, parse_suggestion,
-        parse_usage, permission_response, project_dir_name, read_history,
-        replace_last_token, session_title, tool_call, tool_summary,
+        parse_usage, path_mention, permission_response, project_dir_name,
+        read_history, replace_last_token, session_title, tool_call, tool_summary,
     };
 
     #[test]
@@ -1312,5 +1337,14 @@ mod tests {
         assert_eq!(five_hour.resets_at.unwrap().timestamp(), 1_792_652_999);
         assert_eq!(usage.seven_day, None);
         assert!(parse_usage(&json!({"rate_limits": null})).is_none());
+    }
+
+    #[test]
+    fn dropped_path_mention() {
+        let root = std::path::Path::new("/ws");
+        let mention = |p: &str| path_mention(std::path::Path::new(p), Some(root));
+        assert_eq!(mention("/ws/src/main.rs"), "@src/main.rs");
+        assert_eq!(mention("/other/a.rs"), "@/other/a.rs");
+        assert_eq!(mention("/ws/my notes.md"), "@\"my notes.md\"");
     }
 }

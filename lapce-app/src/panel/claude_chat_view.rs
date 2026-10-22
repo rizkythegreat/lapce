@@ -8,7 +8,7 @@ use std::{
 use floem::{
     IntoView, View,
     action::exec_after,
-    event::EventListener,
+    event::{Event, EventListener, EventPropagation},
     kurbo::Rect,
     peniko::Color,
     reactive::{
@@ -58,6 +58,7 @@ pub fn claude_chat_panel(
     let content_height = create_rw_signal(0.0);
     // Scroll content is unbounded, give it the visible width so text wraps
     let scroll_width = create_rw_signal(0.0);
+    let drop_chat = chat.clone();
 
     {
         let chat = chat.clone();
@@ -171,6 +172,15 @@ pub fn claude_chat_panel(
         }),
         usage_view(chat.usage, config),
     ))
+    // Keeps the window from opening the dropped file in an editor
+    .on_event(EventListener::DroppedFile, move |event| {
+        let Event::DroppedFile(file) = event else {
+            return EventPropagation::Continue;
+        };
+        drop_chat.mention_path(&file.path);
+        focus.set(Focus::Panel(PanelKind::ClaudeChat));
+        EventPropagation::Stop
+    })
     .style(|s| s.absolute().size_pct(100.0, 100.0).flex_col())
     .debug_name("Claude Chat Panel")
 }
