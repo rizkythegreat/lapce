@@ -53,7 +53,7 @@ pub fn claude_chat_panel(
             })
             .style(|s| s.absolute().size_pct(100.0, 100.0)),
         )
-        .style(|s| s.width_full().flex_grow(1.0).flex_basis(0.0)),
+        .style(|s| s.width_full().flex_grow(1.0f32).flex_basis(0.0)),
         label(|| "Claude is working".to_string()).style(move |s| {
             s.padding_horiz(10.0)
                 .color(config.get().color(LapceColor::EDITOR_DIM))
@@ -64,7 +64,7 @@ pub fn claude_chat_panel(
                 .is_focused(is_focused)
                 .build_editor(chat.editor.clone())
                 .placeholder(|| "Ask Claude".to_string())
-                .style(|s| s.flex_grow(1.0).min_width(0.0)),
+                .style(|s| s.flex_grow(1.0f32).min_width(0.0)),
             {
                 let chat = chat.clone();
                 let button_text = move || if busy.get() { "Stop" } else { "Send" };

@@ -3,9 +3,9 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     process::{Child, ChildStdin, Command, Stdio},
     rc::Rc,
+    sync::mpsc::{Sender, channel},
 };
 
-use crossbeam_channel::Sender;
 use floem::{
     ext_event::create_signal_from_channel,
     keyboard::Modifiers,
@@ -22,7 +22,7 @@ use crate::{
     window_tab::CommonData,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChatRole {
     User,
     Assistant,
@@ -30,13 +30,14 @@ pub enum ChatRole {
     Error,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChatMessage {
     pub id: u64,
     pub role: ChatRole,
     pub text: RwSignal<String>,
 }
 
+#[derive(Debug)]
 struct ChatProcess {
     child: Child,
     stdin: ChildStdin,
@@ -45,7 +46,7 @@ struct ChatProcess {
 /// Chat with Claude Code running headless (`claude -p` with stream-json).
 /// The process stays alive across turns; it is respawned with `--resume`
 /// after it exits or is stopped.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ClaudeChatData {
     pub scope: Scope,
     pub editor: EditorData,
@@ -96,7 +97,7 @@ impl KeyPressFocus for ClaudeChatData {
 
 impl ClaudeChatData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = channel();
         let chat = Self {
             scope: cx,
             editor: editors.make_local(cx, common.clone()),
