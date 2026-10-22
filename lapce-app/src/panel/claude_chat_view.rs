@@ -500,6 +500,8 @@ fn ring_svg(percent: f64, track: Color, fill: Color) -> String {
         ),
         track = hex(track),
         fill = hex(fill),
+        arc = arc,
+        circumference = circumference,
     )
 }
 
