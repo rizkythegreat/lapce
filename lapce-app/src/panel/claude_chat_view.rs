@@ -8,11 +8,13 @@ use floem::{
     IntoView, View,
     event::EventListener,
     kurbo::Rect,
+    peniko::Color,
     reactive::{
         ReadSignal, SignalGet, SignalUpdate, SignalWith, create_effect, create_memo,
         create_rw_signal,
     },
     style::{CursorStyle, Style},
+    text::{Attrs, AttrsList, LineHeightValue, TextLayout},
     views::{
         Decorators, container, dyn_stack, empty, label, rich_text, scroll, stack,
     },
@@ -21,11 +23,12 @@ use floem::{
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     claude_chat::{
-        ChatMessage, ChatRole, ClaudeChatData, SessionInfo, SlashCommand,
+        ChatMessage, ChatRole, ClaudeChatData, PermissionDecision, PermissionRequest,
+        SessionInfo, SlashCommand,
     },
     config::{LapceConfig, color::LapceColor},
     doc::relative_time,
-    markdown::{MarkdownContent, from_plaintext, parse_markdown},
+    markdown::{MarkdownContent, parse_markdown},
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
 };
@@ -95,6 +98,7 @@ pub fn claude_chat_panel(
                 .color(config.get().color(LapceColor::EDITOR_DIM))
                 .apply_if(!busy.get(), |s| s.hide())
         }),
+        permission_view(chat.clone(), config),
         command_popup(chat.clone(), config),
         stack((
             TextInputBuilder::new()
@@ -187,6 +191,78 @@ fn text_button(
                 })
                 .selectable(false)
         })
+}
+
+/// Wrapping plain text in the UI font
+fn plain_text(text: &str, color: Color, config: &LapceConfig) -> TextLayout {
+    let attrs = Attrs::new()
+        .color(color)
+        .font_size(config.ui.font_size() as f32)
+        .line_height(LineHeightValue::Normal(1.8));
+    let mut layout = TextLayout::new();
+    layout.set_text(text, AttrsList::new(attrs), None);
+    layout
+}
+
+/// Approval card for the oldest pending tool call
+fn permission_view(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let permissions = chat.permissions;
+    dyn_stack(
+        move || Vec::from_iter(permissions.with(|p| p.front().cloned())),
+        |request| request.request_id.clone(),
+        move |request| permission_card(request, chat.clone(), config),
+    )
+    .style(|s| s.width_full())
+}
+
+fn permission_card(
+    request: PermissionRequest,
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let title = request.title.clone();
+    let detail = request.detail.clone();
+    let button = |text: &'static str, decision: PermissionDecision| {
+        let chat = chat.clone();
+        let id = request.request_id.clone();
+        text_button(
+            move || text,
+            move || chat.answer_permission(&id, decision),
+            config,
+        )
+    };
+    let always = button("Always allow", PermissionDecision::AlwaysAllow);
+    let can_always_allow = request.can_always_allow();
+    stack((
+        label(move || title.clone()).style(|s| s.font_bold()),
+        rich_text(move || {
+            let config = config.get();
+            let color = config.color(LapceColor::EDITOR_FOREGROUND);
+            plain_text(&detail, color, &config)
+        })
+        .style(|s| s.width_full().margin_vert(6.0)),
+        stack((
+            button("Allow", PermissionDecision::Allow),
+            container(always)
+                .style(move |s| s.apply_if(!can_always_allow, |s| s.hide())),
+            button("Deny", PermissionDecision::Deny),
+        ))
+        .style(|s| s.gap(4.0)),
+    ))
+    .style(move |s| {
+        let config = config.get();
+        s.flex_col()
+            .margin_horiz(10.0)
+            .margin_bottom(6.0)
+            .padding(8.0)
+            .border(1.0)
+            .border_radius(6.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+    })
 }
 
 fn command_popup(
@@ -361,8 +437,13 @@ fn message_view(
                 ChatRole::User | ChatRole::Assistant => {
                     parse_markdown(text, 1.8, &config)
                 }
-                ChatRole::Tool | ChatRole::Error => {
-                    from_plaintext(text, 1.8, &config)
+                ChatRole::Tool => {
+                    let color = config.color(LapceColor::EDITOR_DIM);
+                    vec![MarkdownContent::Text(plain_text(text, color, &config))]
+                }
+                ChatRole::Error => {
+                    let color = config.color(LapceColor::LAPCE_ERROR);
+                    vec![MarkdownContent::Text(plain_text(text, color, &config))]
                 }
             })
         },

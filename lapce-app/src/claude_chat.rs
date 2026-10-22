@@ -53,6 +53,30 @@ pub struct SlashCommand {
     pub hint: String,
 }
 
+/// A tool call waiting for the user's approval
+#[derive(Clone, Debug)]
+pub struct PermissionRequest {
+    pub request_id: String,
+    pub title: String,
+    pub detail: String,
+    input: Value,
+    /// Rules Claude Code proposes for "always allow"
+    suggestions: Value,
+}
+
+impl PermissionRequest {
+    pub fn can_always_allow(&self) -> bool {
+        self.suggestions.as_array().is_some_and(|s| !s.is_empty())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionDecision {
+    Allow,
+    AlwaysAllow,
+    Deny,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionInfo {
     pub id: String,
@@ -83,6 +107,8 @@ pub struct ClaudeChatData {
     /// Highlighted row of the slash command popup
     pub command_index: RwSignal<usize>,
     commands_requested: Rc<Cell<bool>>,
+    /// Pending tool approvals, oldest first
+    pub permissions: RwSignal<im::Vector<PermissionRequest>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -156,6 +182,7 @@ impl ClaudeChatData {
             commands: cx.create_rw_signal(Vec::new()),
             command_index: cx.create_rw_signal(0),
             commands_requested: Rc::new(Cell::new(false)),
+            permissions: cx.create_rw_signal(im::Vector::new()),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -217,7 +244,21 @@ impl ClaudeChatData {
             let _ = p.child.kill();
             let _ = p.child.wait();
         }
+        self.permissions.set(im::Vector::new());
         self.busy.set(false);
+    }
+
+    pub fn answer_permission(&self, request_id: &str, decision: PermissionDecision) {
+        let request = self.permissions.try_update(|permissions| {
+            let i = permissions.iter().position(|p| p.request_id == request_id)?;
+            Some(permissions.remove(i))
+        });
+        let Some(request) = request.flatten() else {
+            return;
+        };
+        if let Err(e) = self.write_line(&permission_response(&request, decision)) {
+            self.push(ChatRole::Error, format!("Failed to answer: {e}"));
+        }
     }
 
     /// Slash commands matching the input, tracked
@@ -352,10 +393,9 @@ impl ClaudeChatData {
             "stream-json",
             "--verbose",
             "--include-partial-messages",
-            // ponytail: no permission prompts yet, tools outside the user's
-            // allow list are denied; add --permission-prompt-tool for a dialog
-            "--permission-mode",
-            "acceptEdits",
+            // Tool approvals come to us as `can_use_tool` control requests
+            "--permission-prompt-tool",
+            "stdio",
         ]);
         if let Some(id) = self.session_id.get_untracked() {
             cmd.args(["--resume", &id]);
@@ -420,6 +460,16 @@ impl ClaudeChatData {
             Some("system") if event["subtype"] == "commands_changed" => {
                 if let Some(commands) = parse_commands(&event["commands"]) {
                     self.commands.set(commands);
+                }
+            }
+            Some("control_request") => {
+                if let Some(request) = parse_permission(event) {
+                    self.permissions.update(|p| p.push_back(request));
+                }
+            }
+            Some("control_cancel_request") => {
+                if let Some(id) = event["request_id"].as_str() {
+                    self.permissions.update(|p| p.retain(|r| r.request_id != id));
                 }
             }
             Some("control_response") => {
@@ -635,6 +685,62 @@ fn filter_commands(commands: &[SlashCommand], input: &str) -> Vec<SlashCommand> 
     prefix
 }
 
+fn parse_permission(event: &Value) -> Option<PermissionRequest> {
+    let request = &event["request"];
+    if request["subtype"] != "can_use_tool" {
+        return None;
+    }
+    let name = request["display_name"]
+        .as_str()
+        .or(request["tool_name"].as_str())
+        .unwrap_or("a tool");
+    let input = &request["input"];
+    // Show the full input, the user decides on exactly this
+    let main = ["command", "file_path", "pattern", "url"]
+        .iter()
+        .find_map(|key| input[key].as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string_pretty(input).unwrap_or_default());
+    let detail = match request["description"].as_str() {
+        Some(description) if description != main => format!("{description}\n{main}"),
+        _ => main,
+    };
+    Some(PermissionRequest {
+        request_id: event["request_id"].as_str()?.to_string(),
+        title: format!("Allow {name}?"),
+        detail,
+        input: input.clone(),
+        suggestions: request["permission_suggestions"].clone(),
+    })
+}
+
+fn permission_response(
+    request: &PermissionRequest,
+    decision: PermissionDecision,
+) -> Value {
+    let response = match decision {
+        PermissionDecision::Allow => {
+            json!({ "behavior": "allow", "updatedInput": request.input })
+        }
+        PermissionDecision::AlwaysAllow => json!({
+            "behavior": "allow",
+            "updatedInput": request.input,
+            "updatedPermissions": request.suggestions,
+        }),
+        PermissionDecision::Deny => {
+            json!({ "behavior": "deny", "message": "The user denied this in Lapce" })
+        }
+    };
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request.request_id,
+            "response": response,
+        },
+    })
+}
+
 /// One line describing a tool call, e.g. "Bash: cargo test"
 fn tool_summary(block: &Value) -> String {
     let name = block["name"].as_str().unwrap_or("Tool");
@@ -657,8 +763,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRole, SlashCommand, filter_commands, parse_commands, project_dir_name,
-        read_history, session_title, tool_summary,
+        ChatRole, PermissionDecision, SlashCommand, filter_commands, parse_commands,
+        parse_permission, permission_response, project_dir_name, read_history,
+        session_title, tool_summary,
     };
 
     #[test]
@@ -693,6 +800,44 @@ mod tests {
         assert_eq!(names("/"), ["review", "compact", "caveman:caveman-review"]);
         assert!(names("/review now").is_empty());
         assert!(names("review").is_empty());
+    }
+
+    #[test]
+    fn permission_round_trip() {
+        // Shape captured from claude 2.1.307
+        let event = json!({
+            "type": "control_request",
+            "request_id": "r1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "display_name": "Bash",
+                "input": {"command": "touch a.txt", "description": "Create file"},
+                "description": "Create file",
+                "permission_suggestions": [{"type": "addRules"}],
+            },
+        });
+        let request = parse_permission(&event).unwrap();
+        assert_eq!(request.title, "Allow Bash?");
+        assert_eq!(request.detail, "Create file\ntouch a.txt");
+        assert!(request.can_always_allow());
+
+        let allow = permission_response(&request, PermissionDecision::Allow);
+        assert_eq!(allow["response"]["request_id"], "r1");
+        let inner = &allow["response"]["response"];
+        assert_eq!(inner["behavior"], "allow");
+        assert_eq!(inner["updatedInput"]["command"], "touch a.txt");
+        assert!(inner["updatedPermissions"].is_null());
+
+        let always = permission_response(&request, PermissionDecision::AlwaysAllow);
+        let rules = &always["response"]["response"]["updatedPermissions"];
+        assert_eq!(rules[0]["type"], "addRules");
+
+        let deny = permission_response(&request, PermissionDecision::Deny);
+        assert_eq!(deny["response"]["response"]["behavior"], "deny");
+
+        let other = json!({"type": "control_request", "request": {"subtype": "x"}});
+        assert!(parse_permission(&other).is_none());
     }
 
     #[test]
