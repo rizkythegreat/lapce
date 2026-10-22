@@ -7,9 +7,10 @@ use std::{
 
 use floem::{
     IntoView, View,
-    action::exec_after,
+    action::{exec_after, show_context_menu},
     event::{Event, EventListener, EventPropagation},
     kurbo::Rect,
+    menu::{Menu, MenuItem},
     peniko::Color,
     reactive::{
         ReadSignal, RwSignal, SignalGet, SignalUpdate, SignalWith, create_effect,
@@ -54,7 +55,6 @@ pub fn claude_chat_panel(
     let config = chat.common.config;
     let focus = chat.common.focus;
     let messages = chat.messages;
-    let busy = chat.busy;
     let show_sessions = chat.show_sessions;
     let suggestion = chat.suggestion;
     let internal_command = chat.common.internal_command;
@@ -137,57 +137,25 @@ pub fn claude_chat_panel(
                     Some(suggestion) => format!("{suggestion}  (Enter to use)"),
                     None => "Ask Claude".to_string(),
                 })
-                .style(|s| s.flex_grow(1.0f32).min_width(0.0)),
-            {
-                let chat = chat.clone();
-                clickable_icon(
-                    move || {
-                        if busy.get() {
-                            LapceIcons::DEBUG_STOP
-                        } else {
-                            LapceIcons::LOCATION_FORWARD
-                        }
-                    },
-                    move || {
-                        if busy.get_untracked() {
-                            chat.stop();
-                        } else {
-                            chat.send();
-                        }
-                    },
-                    || false,
-                    || false,
-                    move || if busy.get() { "Stop" } else { "Send" },
-                    config,
-                )
-                .style(|s| s.margin_right(4.0))
-            },
+                .style(|s| s.width_full().min_width(0.0).padding(6.0)),
+            input_toolbar(chat.clone(), config),
         ))
         .on_event_cont(EventListener::PointerDown, move |_| {
             focus.set(Focus::Panel(PanelKind::ClaudeChat));
         })
         .style(move |s| {
             let config = config.get();
-            s.margin(10.0)
-                .padding_left(4.0)
-                .items_center()
+            let border = if is_focused() {
+                LapceColor::EDITOR_FOCUS
+            } else {
+                LapceColor::LAPCE_BORDER
+            };
+            s.flex_col()
+                .margin(10.0)
                 .border(1.0)
                 .border_radius(8.0)
-                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .border_color(config.color(border))
                 .background(config.color(LapceColor::EDITOR_BACKGROUND))
-        }),
-        // Applies from the next message, the process restarts on the same session
-        stack((
-            cycle_button("Model", chat.model, &MODELS, config),
-            cycle_button("Effort", chat.effort, &EFFORTS, config),
-            empty().style(|s| s.flex_grow(1.0f32)),
-            usage_view(chat.usage, config),
-        ))
-        .style(|s| {
-            s.items_center()
-                .margin_top(-6.0)
-                .padding_horiz(6.0)
-                .padding_bottom(6.0)
         }),
     ))
     // Keeps the window from opening the dropped file in an editor
@@ -209,7 +177,7 @@ fn header(
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let show_sessions = chat.show_sessions;
-    let skip = chat.skip_permissions;
+    let usage = chat.usage;
     let chat2 = chat.clone();
     let maximized = {
         let panel = panel.clone();
@@ -223,22 +191,6 @@ fn header(
     let maximized2 = maximized.clone();
     stack((
         text_button(|| "New chat", move || chat.new_session(), config),
-        // Applies from the next message, the process restarts on the same session
-        container(text_button(
-            move || {
-                if skip.get() {
-                    "Permissions: skip"
-                } else {
-                    "Permissions: ask"
-                }
-            },
-            move || skip.update(|skip| *skip = !*skip),
-            config,
-        ))
-        .style(move |s| {
-            let error = config.get().color(LapceColor::LAPCE_ERROR);
-            s.apply_if(skip.get(), |s| s.color(error))
-        }),
         text_button(
             move || if show_sessions.get() { "Back" } else { "Sessions" },
             move || {
@@ -251,6 +203,7 @@ fn header(
             config,
         ),
         empty().style(|s| s.flex_grow(1.0f32)),
+        usage_view(usage, config),
         clickable_icon(
             move || {
                 if maximized() {
@@ -296,24 +249,127 @@ fn text_button<S: std::fmt::Display + 'static>(
         })
 }
 
-/// Steps through `choices` on each click, None shows as "default"
-fn cycle_button(
+/// Bottom row of the input box: permission mode, model and effort on the
+/// left, slash commands and send on the right. Mode, model and effort apply
+/// from the next message, the process restarts on the same session.
+fn input_toolbar(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let skip = chat.skip_permissions;
+    let focus = chat.common.focus;
+    let mode = |skip: bool| {
+        let name = if skip { "Skip permissions" } else { "Ask permissions" };
+        name.to_string()
+    };
+    let slash_chat = chat.clone();
+    stack((
+        container(text_button(
+            move || mode(skip.get()),
+            move || show_choice_menu(skip, &[false, true], mode),
+            config,
+        ))
+        .style(move |s| {
+            let config = config.get();
+            let color = if skip.get() {
+                LapceColor::LAPCE_ERROR
+            } else {
+                LapceColor::EDITOR_DIM
+            };
+            s.color(config.color(color))
+        }),
+        choice_button("Model", chat.model, &MODELS, config),
+        choice_button("Effort", chat.effort, &EFFORTS, config),
+        empty().style(|s| s.flex_grow(1.0f32)),
+        container(text_button(
+            || "/",
+            move || {
+                slash_chat.start_command();
+                focus.set(Focus::Panel(PanelKind::ClaudeChat));
+            },
+            config,
+        ))
+        .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM))),
+        send_button(chat, config),
+    ))
+    .style(|s| s.items_center().padding(4.0).gap(2.0))
+}
+
+/// Square accent button, send when idle and stop while Claude works
+fn send_button(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let busy = chat.busy;
+    container(
+        svg(move || {
+            let icon = if busy.get() {
+                LapceIcons::DEBUG_STOP
+            } else {
+                LapceIcons::LOCATION_FORWARD
+            };
+            config.get().ui_svg(icon)
+        })
+        .style(move |s| {
+            let config = config.get();
+            let size = config.ui.icon_size() as f32;
+            s.size(size, size)
+                .color(config.color(LapceColor::LAPCE_BUTTON_PRIMARY_FOREGROUND))
+        }),
+    )
+    .on_click_stop(move |_| {
+        if busy.get_untracked() {
+            chat.stop();
+        } else {
+            chat.send();
+        }
+    })
+    .style(move |s| {
+        let config = config.get();
+        s.size(24.0, 24.0)
+            .margin_left(4.0)
+            .items_center()
+            .justify_center()
+            .border_radius(4.0)
+            .background(config.color(LapceColor::LAPCE_BUTTON_PRIMARY_BACKGROUND))
+            .hover(|s| s.cursor(CursorStyle::Pointer))
+    })
+}
+
+/// Opens a menu of `choices` with the current one checked, None shows as
+/// "default"
+fn choice_button(
     name: &'static str,
     value: RwSignal<Option<&'static str>>,
     choices: &'static [Option<&'static str>],
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
+    let choice_name =
+        |choice: Option<&str>| choice.unwrap_or("default").to_string();
     container(text_button(
-        move || format!("{name}: {}", value.get().unwrap_or("default")),
-        move || {
-            value.update(|value| {
-                let i = choices.iter().position(|c| *c == *value).unwrap_or(0);
-                *value = choices[(i + 1) % choices.len()];
-            })
-        },
+        move || format!("{name}: {}", choice_name(value.get())),
+        move || show_choice_menu(value, choices, choice_name),
         config,
     ))
     .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
+}
+
+/// Native menu of `choices` with the current one checked, picking one sets
+/// `value`
+fn show_choice_menu<T: Copy + PartialEq + 'static>(
+    value: RwSignal<T>,
+    choices: &[T],
+    name: impl Fn(T) -> String,
+) {
+    let current = value.get_untracked();
+    let menu = choices.iter().fold(Menu::new(""), |menu, &choice| {
+        let mark = if choice == current { "✓ " } else { "    " };
+        menu.entry(
+            MenuItem::new(format!("{mark}{}", name(choice)))
+                .action(move || value.set(choice)),
+        )
+    });
+    show_context_menu(menu, None);
 }
 
 /// "Thinking...", "Running Bash..." or "Waiting for approval..." while busy
@@ -355,7 +411,7 @@ fn working_view(
     })
 }
 
-/// "5h 74%, resets 14:09 · Week 8%, resets Wed 05:59" under the input,
+/// "5h 74%, resets 14:09 · Week 8%, resets Wed 05:59" in the header,
 /// hidden until Claude Code reports it. Reset times are local wall clock.
 fn usage_view(
     usage: RwSignal<Option<UsageLimits>>,
@@ -380,6 +436,8 @@ fn usage_view(
     })
     .style(move |s| {
         s.padding_horiz(8.0)
+            .min_width(0.0)
+            .text_ellipsis()
             .color(config.get().color(LapceColor::EDITOR_DIM))
             .selectable(false)
             .apply_if(usage.get().is_none(), |s| s.hide())
