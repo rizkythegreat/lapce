@@ -20,6 +20,7 @@ use lapce_core::{
     mode::Mode,
     selection::Selection,
 };
+use lapce_rpc::proxy::ProxyResponse;
 use lapce_xi_rope::Rope;
 use serde_json::{Value, json};
 
@@ -59,6 +60,16 @@ pub struct ToolCall {
 
 /// A message read back from a session file
 type HistoryItem = (ChatRole, String, Option<ToolCall>);
+
+/// A row of the input popup: a slash command or an `@` file mention
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PopupItem {
+    pub label: String,
+    pub hint: String,
+    pub description: String,
+    /// Replaces the last token of the input
+    pub insert: String,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
@@ -102,6 +113,8 @@ pub struct SessionInfo {
 struct ChatProcess {
     child: Child,
     stdin: ChildStdin,
+    /// Started with `--dangerously-skip-permissions`
+    skip_permissions: bool,
 }
 
 /// Chat with Claude Code running headless (`claude -p` with stream-json).
@@ -118,9 +131,15 @@ pub struct ClaudeChatData {
     pub show_sessions: RwSignal<bool>,
     /// Slash commands reported by Claude Code, kept across processes
     pub commands: RwSignal<Vec<SlashCommand>>,
-    /// Highlighted row of the slash command popup
-    pub command_index: RwSignal<usize>,
+    /// Workspace files for `@` mentions, relative to the workspace
+    pub files: RwSignal<Vec<String>>,
+    /// Highlighted row of the input popup
+    pub popup_index: RwSignal<usize>,
     commands_requested: Rc<Cell<bool>>,
+    /// Claude Code's guess at the next prompt, shown in the empty input
+    pub suggestion: RwSignal<Option<String>>,
+    /// Run tools without asking. Off on every launch.
+    pub skip_permissions: RwSignal<bool>,
     /// Pending tool approvals, oldest first
     pub permissions: RwSignal<im::Vector<PermissionRequest>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
@@ -140,7 +159,7 @@ impl KeyPressFocus for ClaudeChatData {
         match condition {
             Condition::PanelFocus => true,
             // Lets up/down/enter drive the slash command popup
-            Condition::ListFocus => !self.command_matches().is_empty(),
+            Condition::ListFocus => !self.popup_items().is_empty(),
             _ => false,
         }
     }
@@ -153,15 +172,15 @@ impl KeyPressFocus for ClaudeChatData {
     ) -> CommandExecuted {
         match &command.kind {
             CommandKind::Focus(FocusCommand::ListNext) => {
-                self.move_command_index(1);
+                self.move_popup_index(1);
                 CommandExecuted::Yes
             }
             CommandKind::Focus(FocusCommand::ListPrevious) => {
-                self.move_command_index(-1);
+                self.move_popup_index(-1);
                 CommandExecuted::Yes
             }
             CommandKind::Focus(FocusCommand::ListSelect) => {
-                self.select_command();
+                self.select_popup_item();
                 CommandExecuted::Yes
             }
             CommandKind::Edit(EditCommand::InsertNewLine) => {
@@ -194,8 +213,11 @@ impl ClaudeChatData {
             sessions: cx.create_rw_signal(Vec::new()),
             show_sessions: cx.create_rw_signal(false),
             commands: cx.create_rw_signal(Vec::new()),
-            command_index: cx.create_rw_signal(0),
+            files: cx.create_rw_signal(Vec::new()),
+            popup_index: cx.create_rw_signal(0),
             commands_requested: Rc::new(Cell::new(false)),
+            suggestion: cx.create_rw_signal(None),
+            skip_permissions: cx.create_rw_signal(false),
             permissions: cx.create_rw_signal(im::Vector::new()),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
@@ -226,11 +248,27 @@ impl ClaudeChatData {
         let text = self.editor.doc().buffer.with_untracked(|b| b.to_string());
         let text = text.trim();
         if text.is_empty() {
+            // Enter on the empty input takes the suggested prompt
+            if let Some(suggestion) = self.suggestion.get_untracked() {
+                self.set_input(suggestion);
+            }
             return;
         }
         self.editor.reset();
-        self.command_index.set(0);
+        self.popup_index.set(0);
+        self.suggestion.set(None);
         self.push(ChatRole::User, text.to_string());
+
+        // The permission mode is fixed at spawn, restart (and resume) on a toggle
+        let skip = self.skip_permissions.get_untracked();
+        let stale = self
+            .process
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.skip_permissions != skip);
+        if stale {
+            self.stop();
+        }
 
         let running = self.process.borrow().is_some();
         if !running && let Err(e) = self.spawn() {
@@ -259,6 +297,7 @@ impl ClaudeChatData {
             let _ = p.child.wait();
         }
         self.permissions.set(im::Vector::new());
+        self.suggestion.set(None);
         self.busy.set(false);
     }
 
@@ -275,10 +314,55 @@ impl ClaudeChatData {
         }
     }
 
-    /// Slash commands matching the input, tracked
-    pub fn command_matches(&self) -> Vec<SlashCommand> {
+    /// Popup rows for the input, tracked
+    pub fn popup_items(&self) -> Vec<PopupItem> {
         let input = self.editor.doc_signal().get().buffer.with(|b| b.to_string());
-        self.commands.with(|commands| filter_commands(commands, &input))
+        if input.starts_with('/') {
+            let commands = self.commands.with(|c| filter_commands(c, &input));
+            return commands
+                .into_iter()
+                .map(|c| PopupItem {
+                    label: format!("/{}", c.name),
+                    insert: format!("/{} ", c.name),
+                    hint: c.hint,
+                    description: c.description,
+                })
+                .collect();
+        }
+        let Some(query) = mention_query(&input) else {
+            return Vec::new();
+        };
+        let files = self.files.with(|files| filter_files(files, query));
+        files
+            .into_iter()
+            .map(|path| PopupItem {
+                insert: format!("@{path} "),
+                label: path,
+                hint: String::new(),
+                description: String::new(),
+            })
+            .collect()
+    }
+
+    /// Reload the workspace file list, done each time an `@` mention starts
+    pub fn request_files(&self) {
+        let workspace = self.common.workspace.path.clone();
+        let files = self.files;
+        let send = create_ext_action(self.scope, move |items: Vec<PathBuf>| {
+            let relative = items.iter().map(|path| {
+                let path = match workspace.as_ref() {
+                    Some(root) => path.strip_prefix(root).unwrap_or(path),
+                    None => path,
+                };
+                path.to_string_lossy().into_owned()
+            });
+            files.set(relative.collect());
+        });
+        self.common.proxy.get_files(move |result| {
+            if let Ok(ProxyResponse::GetFilesResponse { items }) = result {
+                send(items);
+            }
+        });
     }
 
     /// Start Claude Code early so it can report its slash commands. Starting
@@ -293,37 +377,42 @@ impl ClaudeChatData {
         }
     }
 
-    pub fn complete_command(&self, name: &str) {
-        let text = format!("/{name} ");
+    pub fn apply_item(&self, item: &PopupItem) {
+        let input = self.editor.doc().buffer.with_untracked(|b| b.to_string());
+        self.set_input(replace_last_token(&input, &item.insert));
+        self.popup_index.set(0);
+    }
+
+    /// Replace the input and put the cursor at its end
+    fn set_input(&self, text: String) {
         let len = text.len();
         self.editor.doc().reload(Rope::from(text), true);
         self.editor
             .cursor()
             .update(|cursor| cursor.set_insert(Selection::caret(len)));
-        self.command_index.set(0);
     }
 
-    fn select_command(&self) {
-        let matches = self.command_matches();
-        let index = self.command_index.get_untracked();
-        let Some(command) = matches.get(index).or(matches.last()) else {
+    fn select_popup_item(&self) {
+        let items = self.popup_items();
+        let index = self.popup_index.get_untracked();
+        let Some(item) = items.get(index).or(items.last()) else {
             return;
         };
         let input = self.editor.doc().buffer.with_untracked(|b| b.to_string());
         // Enter on a fully typed command runs it
-        if input.trim() == format!("/{}", command.name) {
+        if input.trim() == item.insert.trim() {
             self.send();
         } else {
-            self.complete_command(&command.name);
+            self.apply_item(item);
         }
     }
 
-    fn move_command_index(&self, delta: isize) {
-        let len = self.command_matches().len();
+    fn move_popup_index(&self, delta: isize) {
+        let len = self.popup_items().len();
         if len == 0 {
             return;
         }
-        self.command_index.update(|index| {
+        self.popup_index.update(|index| {
             *index = (*index as isize + delta).rem_euclid(len as isize) as usize;
         });
     }
@@ -410,7 +499,14 @@ impl ClaudeChatData {
             // Tool approvals come to us as `can_use_tool` control requests
             "--permission-prompt-tool",
             "stdio",
+            // Emits a `prompt_suggestion` message after each turn
+            "--prompt-suggestions",
+            "true",
         ]);
+        let skip_permissions = self.skip_permissions.get_untracked();
+        if skip_permissions {
+            cmd.arg("--dangerously-skip-permissions");
+        }
         if let Some(id) = self.session_id.get_untracked() {
             cmd.args(["--resume", &id]);
         }
@@ -451,7 +547,11 @@ impl ClaudeChatData {
             let _ = tx.send((generation, json!({"type": "exit"})));
         });
 
-        *self.process.borrow_mut() = Some(ChatProcess { child, stdin });
+        *self.process.borrow_mut() = Some(ChatProcess {
+            child,
+            stdin,
+            skip_permissions,
+        });
         // Ask for the slash commands, answered without an API request
         self.write_line(&json!({
             "type": "control_request",
@@ -480,6 +580,9 @@ impl ClaudeChatData {
                 if let Some(request) = parse_permission(event) {
                     self.permissions.update(|p| p.push_back(request));
                 }
+            }
+            Some("prompt_suggestion") => {
+                self.suggestion.set(parse_suggestion(event));
             }
             Some("control_cancel_request") => {
                 if let Some(id) = event["request_id"].as_str() {
@@ -715,6 +818,48 @@ fn filter_commands(commands: &[SlashCommand], input: &str) -> Vec<SlashCommand> 
     prefix
 }
 
+/// The `@` mention being typed at the end of the input, without the `@`
+pub fn mention_query(input: &str) -> Option<&str> {
+    last_token(input).strip_prefix('@')
+}
+
+/// Text after the last whitespace, empty when the input ends with whitespace
+fn last_token(input: &str) -> &str {
+    input.rsplit(char::is_whitespace).next().unwrap_or_default()
+}
+
+fn replace_last_token(input: &str, insert: &str) -> String {
+    let start = input.len() - last_token(input).len();
+    format!("{}{insert}", &input[..start])
+}
+
+/// File name prefix matches first, then any path containing the query
+fn filter_files(files: &[String], query: &str) -> Vec<String> {
+    let query = query.to_lowercase();
+    let (mut prefix, rest): (Vec<_>, Vec<_>) = files
+        .iter()
+        .filter(|path| path.to_lowercase().contains(&query))
+        .cloned()
+        .partition(|path| {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or_default();
+            name.to_lowercase().starts_with(&query)
+        });
+    prefix.extend(rest);
+    prefix.truncate(8);
+    prefix
+}
+
+/// The predicted prompt. The CLI help names the message but not its fields,
+/// so take the first known text field.
+fn parse_suggestion(event: &Value) -> Option<String> {
+    ["suggestion", "prompt", "text"]
+        .iter()
+        .find_map(|key| event[key].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 fn parse_permission(event: &Value) -> Option<PermissionRequest> {
     let request = &event["request"];
     if request["subtype"] != "can_use_tool" {
@@ -844,8 +989,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChatRole, PermissionDecision, SlashCommand, filter_commands, parse_commands,
-        parse_permission, permission_response, project_dir_name, read_history,
+        ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
+        mention_query, parse_commands, parse_permission, parse_suggestion,
+        permission_response, project_dir_name, read_history, replace_last_token,
         session_title, tool_call, tool_summary,
     };
 
@@ -944,6 +1090,33 @@ mod tests {
         assert!(!call.edits_file);
         assert!(call.diff.is_none());
         assert!(call.file.is_some());
+    }
+
+    #[test]
+    fn file_mentions() {
+        assert_eq!(mention_query("look at @src/ma"), Some("src/ma"));
+        assert_eq!(mention_query("@"), Some(""));
+        assert_eq!(mention_query("@src "), None);
+        assert_eq!(mention_query("email a@b"), None);
+        assert_eq!(
+            replace_last_token("look at @ma", "@src/main.rs "),
+            "look at @src/main.rs "
+        );
+        assert_eq!(replace_last_token("/rev", "/review "), "/review ");
+
+        let files = ["src/main.rs", "src/lib.rs", "domain/model.rs"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(filter_files(&files, "ma"), ["src/main.rs", "domain/model.rs"]);
+        assert_eq!(filter_files(&files, "LIB"), ["src/lib.rs"]);
+    }
+
+    #[test]
+    fn suggestion_takes_known_text_field() {
+        let event = json!({"type": "prompt_suggestion", "suggestion": " go on "});
+        assert_eq!(parse_suggestion(&event).as_deref(), Some("go on"));
+        let empty = json!({"type": "prompt_suggestion", "suggestion": ""});
+        assert_eq!(parse_suggestion(&empty), None);
     }
 
     #[test]

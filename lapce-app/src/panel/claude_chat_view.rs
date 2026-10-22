@@ -24,7 +24,7 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, PermissionDecision, PermissionRequest,
-        SessionInfo, SlashCommand, ToolCall,
+        PopupItem, SessionInfo, ToolCall, mention_query,
     },
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor},
@@ -45,6 +45,7 @@ pub fn claude_chat_panel(
     let messages = chat.messages;
     let busy = chat.busy;
     let show_sessions = chat.show_sessions;
+    let suggestion = chat.suggestion;
     let internal_command = chat.common.internal_command;
     let is_focused = move || focus.get() == Focus::Panel(PanelKind::ClaudeChat);
     let content_height = create_rw_signal(0.0);
@@ -53,13 +54,21 @@ pub fn claude_chat_panel(
 
     {
         let chat = chat.clone();
-        create_effect(move |_| {
+        create_effect(move |was_mention: Option<bool>| {
             let doc = chat.editor.doc_signal().get();
-            let slash = doc.buffer.with(|b| b.to_string().starts_with('/'));
-            chat.command_index.set(0);
-            if slash && chat.commands.with_untracked(|c| c.is_empty()) {
+            let input = doc.buffer.with(|b| b.to_string());
+            chat.popup_index.set(0);
+            if input.starts_with('/')
+                && chat.commands.with_untracked(|c| c.is_empty())
+            {
                 chat.request_commands();
             }
+            // Fresh file list each time a new mention starts
+            let mention = mention_query(&input).is_some();
+            if mention && was_mention != Some(true) {
+                chat.request_files();
+            }
+            mention
         });
     }
 
@@ -107,7 +116,10 @@ pub fn claude_chat_panel(
             TextInputBuilder::new()
                 .is_focused(is_focused)
                 .build_editor(chat.editor.clone())
-                .placeholder(|| "Ask Claude".to_string())
+                .placeholder(move || match suggestion.get() {
+                    Some(suggestion) => format!("{suggestion}  (Enter to use)"),
+                    None => "Ask Claude".to_string(),
+                })
                 .style(|s| s.flex_grow(1.0f32).min_width(0.0)),
             {
                 let chat = chat.clone();
@@ -152,9 +164,20 @@ pub fn claude_chat_panel(
 
 fn header(chat: ClaudeChatData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
     let show_sessions = chat.show_sessions;
+    let skip = chat.skip_permissions;
     let chat2 = chat.clone();
     stack((
         text_button(|| "New chat", move || chat.new_session(), config),
+        // Applies from the next message, the process restarts on the same session
+        container(text_button(
+            move || if skip.get() { "Permissions: skip" } else { "Permissions: ask" },
+            move || skip.update(|skip| *skip = !*skip),
+            config,
+        ))
+        .style(move |s| {
+            let error = config.get().color(LapceColor::LAPCE_ERROR);
+            s.apply_if(skip.get(), |s| s.color(error))
+        }),
         text_button(
             move || if show_sessions.get() { "Back" } else { "Sessions" },
             move || {
@@ -274,12 +297,12 @@ fn command_popup(
 ) -> impl View {
     let matches = {
         let chat = chat.clone();
-        create_memo(move |_| chat.command_matches())
+        create_memo(move |_| chat.popup_items())
     };
     dyn_stack(
         move || matches.get().into_iter().enumerate().collect::<Vec<_>>(),
-        |(i, command)| (*i, command.name.clone()),
-        move |(i, command)| command_row(i, command, chat.clone(), config),
+        |(i, item)| (*i, item.label.clone()),
+        move |(i, item)| popup_row(i, item, chat.clone(), config),
     )
     .style(move |s| {
         s.flex_col()
@@ -292,27 +315,25 @@ fn command_popup(
     })
 }
 
-fn command_row(
+fn popup_row(
     i: usize,
-    command: SlashCommand,
+    item: PopupItem,
     chat: ClaudeChatData,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    let SlashCommand {
-        name,
+    let PopupItem {
+        label: text,
         description,
         hint,
-    } = command;
-    let index = chat.command_index;
+        ..
+    } = item.clone();
+    let index = chat.popup_index;
     let focus = chat.common.focus;
     let dim = move |s: Style| {
         s.margin_left(8.0).color(config.get().color(LapceColor::EDITOR_DIM))
     };
     stack((
-        label({
-            let name = name.clone();
-            move || format!("/{name}")
-        }),
+        label(move || text.clone()),
         label(move || hint.clone()).style(dim),
         label(move || description.clone()).style(move |s| {
             dim(s)
@@ -324,7 +345,7 @@ fn command_row(
     ))
     .on_click_stop(move |_| {
         focus.set(Focus::Panel(PanelKind::ClaudeChat));
-        chat.complete_command(&name);
+        chat.apply_item(&item);
     })
     .style(move |s| {
         let config = config.get();
