@@ -28,7 +28,8 @@ use crate::{
     app::clickable_icon,
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, PermissionDecision, PermissionRequest,
-        PopupItem, SessionInfo, ToolCall, ToolStatus, mention_query,
+        PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits, UsageWindow,
+        mention_query,
     },
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
@@ -168,6 +169,7 @@ pub fn claude_chat_panel(
                 .border_color(config.color(LapceColor::LAPCE_BORDER))
                 .background(config.color(LapceColor::EDITOR_BACKGROUND))
         }),
+        usage_view(chat.usage, config),
     ))
     .style(|s| s.absolute().size_pct(100.0, 100.0).flex_col())
     .debug_name("Claude Chat Panel")
@@ -302,6 +304,39 @@ fn working_view(
             .padding_vert(2.0)
             .color(config.get().color(LapceColor::EDITOR_DIM))
             .apply_if(!busy.get(), |s| s.hide())
+    })
+}
+
+/// "5h 74%, resets 14:09 · Week 8%, resets Wed 05:59" under the input,
+/// hidden until Claude Code reports it. Reset times are local wall clock.
+fn usage_view(
+    usage: RwSignal<Option<UsageLimits>>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let window = |w: Option<UsageWindow>, time_format: &str| match w {
+        Some(w) => match w.resets_at {
+            Some(t) => {
+                format!("{:.0}%, resets {}", w.percent, t.format(time_format))
+            }
+            None => format!("{:.0}%", w.percent),
+        },
+        None => "-".to_string(),
+    };
+    label(move || {
+        let usage = usage.get().unwrap_or_default();
+        format!(
+            "5h {} · Week {}",
+            window(usage.five_hour, "%H:%M"),
+            window(usage.seven_day, "%a %H:%M")
+        )
+    })
+    .style(move |s| {
+        s.margin_top(-6.0)
+            .padding_horiz(14.0)
+            .padding_bottom(6.0)
+            .color(config.get().color(LapceColor::EDITOR_DIM))
+            .selectable(false)
+            .apply_if(usage.get().is_none(), |s| s.hide())
     })
 }
 

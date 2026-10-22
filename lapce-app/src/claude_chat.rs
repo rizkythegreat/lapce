@@ -9,6 +9,7 @@ use std::{
     time::SystemTime,
 };
 
+use chrono::{DateTime, Local};
 use floem::{
     ext_event::{create_ext_action, create_signal_from_channel},
     keyboard::Modifiers,
@@ -123,6 +124,19 @@ pub struct SessionInfo {
     pub modified: SystemTime,
 }
 
+/// Plan usage of each window, from Claude Code's `get_usage`
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UsageLimits {
+    pub five_hour: Option<UsageWindow>,
+    pub seven_day: Option<UsageWindow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsageWindow {
+    pub percent: f64,
+    pub resets_at: Option<DateTime<Local>>,
+}
+
 #[derive(Debug)]
 struct ChatProcess {
     child: Child,
@@ -156,6 +170,8 @@ pub struct ClaudeChatData {
     pub skip_permissions: RwSignal<bool>,
     /// Pending tool approvals, oldest first
     pub permissions: RwSignal<im::Vector<PermissionRequest>>,
+    /// Refreshed on spawn and after every turn, None until first answered
+    pub usage: RwSignal<Option<UsageLimits>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -233,6 +249,7 @@ impl ClaudeChatData {
             suggestion: cx.create_rw_signal(None),
             skip_permissions: cx.create_rw_signal(false),
             permissions: cx.create_rw_signal(im::Vector::new()),
+            usage: cx.create_rw_signal(None),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -599,7 +616,18 @@ impl ClaudeChatData {
             "type": "control_request",
             "request_id": "lapce-initialize",
             "request": { "subtype": "initialize" },
-        }))
+        }))?;
+        self.request_usage();
+        Ok(())
+    }
+
+    /// Ask for plan usage, read from the claude.ai usage endpoint, no model request
+    fn request_usage(&self) {
+        let _ = self.write_line(&json!({
+            "type": "control_request",
+            "request_id": "lapce-usage",
+            "request": { "subtype": "get_usage", "skip_behaviors": true },
+        }));
     }
 
     fn handle_event(&self, event: &Value) {
@@ -629,6 +657,13 @@ impl ClaudeChatData {
             Some("control_cancel_request") => {
                 if let Some(id) = event["request_id"].as_str() {
                     self.permissions.update(|p| p.retain(|r| r.request_id != id));
+                }
+            }
+            Some("control_response")
+                if event["response"]["request_id"] == "lapce-usage" =>
+            {
+                if let Some(usage) = parse_usage(&event["response"]["response"]) {
+                    self.usage.set(Some(usage));
                 }
             }
             Some("control_response") => {
@@ -685,6 +720,7 @@ impl ClaudeChatData {
             }
             Some("result") => {
                 self.busy.set(false);
+                self.request_usage();
                 if event["is_error"] == true {
                     let text = event["result"].as_str().unwrap_or("Request failed");
                     self.push(ChatRole::Error, text.to_string());
@@ -858,6 +894,25 @@ fn read_history(reader: impl BufRead) -> Vec<HistoryItem> {
         }
     }
     history
+}
+
+/// None when plan limits do not apply (API key, Bedrock, Vertex)
+fn parse_usage(response: &Value) -> Option<UsageLimits> {
+    let limits = response["rate_limits"].as_object()?;
+    let window = |key: &str| {
+        let window = limits.get(key)?;
+        Some(UsageWindow {
+            percent: window["utilization"].as_f64()?,
+            resets_at: window["resets_at"]
+                .as_str()
+                .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&Local)),
+        })
+    };
+    Some(UsageLimits {
+        five_hour: window("five_hour"),
+        seven_day: window("seven_day"),
+    })
 }
 
 fn parse_commands(commands: &Value) -> Option<Vec<SlashCommand>> {
@@ -1072,8 +1127,8 @@ mod tests {
     use super::{
         ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
         mention_query, parse_commands, parse_permission, parse_suggestion,
-        permission_response, project_dir_name, read_history, replace_last_token,
-        session_title, tool_call, tool_summary,
+        parse_usage, permission_response, project_dir_name, read_history,
+        replace_last_token, session_title, tool_call, tool_summary,
     };
 
     #[test]
@@ -1243,5 +1298,19 @@ mod tests {
         assert_eq!(history[2].1, "Bash: ls");
         assert!(history[0].2.is_none());
         assert_eq!(history[2].2.as_ref().unwrap().file, None);
+    }
+
+    #[test]
+    fn usage() {
+        let response = json!({"rate_limits": {
+            "five_hour": {"utilization": 74, "resets_at": "2026-10-22T07:09:59Z"},
+            "seven_day": null,
+        }});
+        let usage = parse_usage(&response).unwrap();
+        let five_hour = usage.five_hour.unwrap();
+        assert_eq!(five_hour.percent, 74.0);
+        assert_eq!(five_hour.resets_at.unwrap().timestamp(), 1_792_652_999);
+        assert_eq!(usage.seven_day, None);
+        assert!(parse_usage(&json!({"rate_limits": null})).is_none());
     }
 }
