@@ -40,7 +40,7 @@ use crate::{
     editor::EditorData,
     keypress::{KeyPressFocus, condition::Condition},
     main_split::Editors,
-    markdown::{MarkdownContent, parse_markdown},
+    markdown::{MarkdownContent, list_item_view, parse_markdown, table_view},
     panel::plugin_view::VOLT_DEFAULT_PNG,
     web_link::web_link,
     window_tab::CommonData,
@@ -984,6 +984,21 @@ pub fn plugin_info_view(plugin: PluginData, volt: VoltID) -> impl View {
                                             .style(|s| s.width_full()),
                                     )
                                     .style(|s| s.width_full().padding_vert(4.0)),
+                                    MarkdownContent::ListItem {
+                                        marker,
+                                        depth,
+                                        layout,
+                                    } => container(list_item_view(
+                                        marker, depth, layout,
+                                    ))
+                                    .style(|s| s.width_full()),
+                                    MarkdownContent::Table(rows) => {
+                                        let border = config
+                                            .get_untracked()
+                                            .color(LapceColor::LAPCE_BORDER);
+                                        container(table_view(rows, border))
+                                            .style(|s| s.padding_vert(4.0))
+                                    }
                                     MarkdownContent::Image { .. } => {
                                         container(empty())
                                     }

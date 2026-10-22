@@ -36,7 +36,7 @@ use crate::{
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     doc::relative_time,
     listener::Listener,
-    markdown::{MarkdownContent, parse_markdown},
+    markdown::{MarkdownContent, list_item_view, parse_markdown, table_view},
     panel::data::PanelData,
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
@@ -708,23 +708,32 @@ fn text_view(
         move |content| match content {
             // A bubble shrinks to short prompts, so only cap the width there.
             // Replies stop near 80 characters so long lines stay readable.
+            // List items sit tight, other blocks get a little room.
             MarkdownContent::Text(text_layout) => {
                 rich_text(move || text_layout.clone())
-                    .style(move |s| {
-                        let max_width =
-                            config.get().ui.font_size() as f64 * REPLY_MAX_EMS;
-                        s.apply_if(role == ChatRole::User, |s| s.max_width_full())
-                            .apply_if(role != ChatRole::User, |s| {
-                                s.width_full().max_width(max_width)
-                            })
-                    })
+                    .style(move |s| text_width(s, role, config).margin_vert(4.0))
                     .into_any()
             }
+            MarkdownContent::ListItem {
+                marker,
+                depth,
+                layout,
+            } => container(list_item_view(marker, depth, layout))
+                .style(move |s| text_width(s, role, config))
+                .into_any(),
             MarkdownContent::CodeBlock {
                 layout,
                 language,
                 code,
-            } => code_block_view(layout, language, code, config).into_any(),
+            } => container(code_block_view(layout, language, code, config))
+                .style(|s| s.width_full().margin_vert(4.0))
+                .into_any(),
+            MarkdownContent::Table(rows) => {
+                let border = config.get_untracked().color(LapceColor::LAPCE_BORDER);
+                container(table_view(rows, border))
+                    .style(|s| s.max_width_full().margin_vert(4.0))
+                    .into_any()
+            }
             MarkdownContent::Image { .. } => empty().into_any(),
             MarkdownContent::Separator => empty()
                 .style(move |s| {
@@ -736,7 +745,17 @@ fn text_view(
                 .into_any(),
         },
     )
-    .style(|s| s.flex_col().max_width_full().gap(8.0))
+    .style(|s| s.flex_col().max_width_full())
+}
+
+fn text_width(
+    s: Style,
+    role: ChatRole,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> Style {
+    let max_width = config.get().ui.font_size() as f64 * REPLY_MAX_EMS;
+    s.apply_if(role == ChatRole::User, |s| s.max_width_full())
+        .apply_if(role != ChatRole::User, |s| s.width_full().max_width(max_width))
 }
 
 /// Code in a bordered box, its language and a copy button on top

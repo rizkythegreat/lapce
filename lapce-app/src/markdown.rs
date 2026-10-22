@@ -1,5 +1,11 @@
-use floem::text::{
-    Attrs, AttrsList, FamilyOwned, LineHeightValue, Style, TextLayout, Weight,
+use floem::{
+    View,
+    peniko::Color,
+    taffy::{prelude::auto, style::TrackSizingFunction},
+    text::{
+        Attrs, AttrsList, FamilyOwned, LineHeightValue, Style, TextLayout, Weight,
+    },
+    views::{Decorators, rich_text, stack, stack_from_iter},
 };
 use lapce_core::{language::LapceLanguage, syntax::Syntax};
 use lapce_xi_rope::Rope;
@@ -12,14 +18,84 @@ use crate::config::{LapceConfig, color::LapceColor};
 #[derive(Clone)]
 pub enum MarkdownContent {
     Text(TextLayout),
+    /// A list item's text, its bullet or number kept apart so wrapped lines
+    /// line up after it. `depth` is 0 in a top level list.
+    ListItem {
+        marker: TextLayout,
+        depth: usize,
+        layout: TextLayout,
+    },
     /// Highlighted code, `language` is the fence info's first word
     CodeBlock {
         layout: TextLayout,
         language: String,
         code: String,
     },
+    /// Cells by row, the first row is the header
+    Table(Vec<Vec<TextLayout>>),
     Image { url: String, title: String },
     Separator,
+}
+
+/// Text collected for the next item, flushed at item and block boundaries
+struct Builder<'a> {
+    res: Vec<MarkdownContent>,
+    text: String,
+    attrs: AttrsList,
+    default_attrs: Attrs<'a>,
+    /// Marker and depth of the list item the text belongs to
+    item: Option<(String, usize)>,
+}
+
+impl<'a> Builder<'a> {
+    fn new(default_attrs: Attrs<'a>) -> Self {
+        Self {
+            res: Vec::new(),
+            text: String::new(),
+            attrs: AttrsList::new(default_attrs.clone()),
+            default_attrs,
+            item: None,
+        }
+    }
+
+    /// The collected text without trailing line breaks, None when empty
+    fn take_layout(&mut self) -> Option<TextLayout> {
+        let attrs = std::mem::replace(
+            &mut self.attrs,
+            AttrsList::new(self.default_attrs.clone()),
+        );
+        let text = std::mem::take(&mut self.text);
+        let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            return None;
+        }
+        let mut layout = TextLayout::new();
+        layout.set_text(text, attrs, None);
+        Some(layout)
+    }
+
+    fn flush(&mut self) {
+        let Some(layout) = self.take_layout() else {
+            return;
+        };
+        let content = match self.item.take() {
+            Some((marker, depth)) => {
+                let mut marker_layout = TextLayout::new();
+                marker_layout.set_text(
+                    &marker,
+                    AttrsList::new(self.default_attrs.clone()),
+                    None,
+                );
+                MarkdownContent::ListItem {
+                    marker: marker_layout,
+                    depth,
+                    layout,
+                }
+            }
+            None => MarkdownContent::Text(layout),
+        };
+        self.res.push(content);
+    }
 }
 
 pub fn parse_markdown(
@@ -27,9 +103,6 @@ pub fn parse_markdown(
     line_height: f64,
     config: &LapceConfig,
 ) -> Vec<MarkdownContent> {
-    let mut res = Vec::new();
-
-    let mut current_text = String::new();
     let code_font_family: Vec<FamilyOwned> =
         FamilyOwned::parse_list(&config.editor.font_family).collect();
 
@@ -37,15 +110,11 @@ pub fn parse_markdown(
         .color(config.color(LapceColor::EDITOR_FOREGROUND))
         .font_size(config.ui.font_size() as f32)
         .line_height(LineHeightValue::Normal(line_height as f32));
-    let mut attr_list = AttrsList::new(default_attrs.clone());
     // Attrs has no background, so inline code stands out by color instead
     let inline_code_color = config
         .style_color("string")
         .unwrap_or_else(|| config.color(LapceColor::EDITOR_FOREGROUND));
-
-    let mut builder_dirty = false;
-
-    let mut pos = 0;
+    let mut out = Builder::new(default_attrs.clone());
 
     let mut tag_stack: SmallVec<[(usize, Tag); 4]> = SmallVec::new();
 
@@ -62,15 +131,17 @@ pub fn parse_markdown(
     let mut add_newlines = 0;
     // Next number of each open list, None for bullet lists
     let mut lists: SmallVec<[Option<u64>; 4]> = SmallVec::new();
+    // Rows of the table being read
+    let mut table: Vec<Vec<TextLayout>> = Vec::new();
     for event in parser {
-        // Add the newlines since we're going to be outputting more. Code blocks
-        // already end with one, count it.
-        let trailing =
-            current_text.len() - current_text.trim_end_matches('\n').len();
-        for _ in trailing..add_newlines {
-            current_text.push('\n');
-            builder_dirty = true;
-            pos += 1;
+        // Add the newlines since we're going to be outputting more. None at the
+        // start of an item, and code blocks already end with one.
+        if !out.text.is_empty() {
+            let trailing =
+                out.text.len() - out.text.trim_end_matches('\n').len();
+            for _ in trailing..add_newlines {
+                out.text.push('\n');
+            }
         }
         add_newlines = 0;
 
@@ -79,50 +150,44 @@ pub fn parse_markdown(
                 match &tag {
                     Tag::List(start) => lists.push(*start),
                     Tag::Item => {
-                        // A nested list starts right after its parent item's text
-                        if !current_text.is_empty() && !current_text.ends_with('\n')
-                        {
-                            current_text.push('\n');
-                            pos += 1;
-                        }
-                        let indent = "    ".repeat(lists.len().saturating_sub(1));
+                        // Ends the text before, such as the parent item's
+                        out.flush();
                         let marker = match lists.last_mut() {
                             Some(Some(n)) => {
                                 *n += 1;
-                                format!("{indent}{}. ", *n - 1)
+                                format!("{}.", *n - 1)
                             }
-                            _ => format!("{indent}• "),
+                            _ => "•".to_string(),
                         };
-                        current_text.push_str(&marker);
-                        pos += marker.len();
-                        builder_dirty = true;
+                        out.item = Some((marker, lists.len().saturating_sub(1)));
                     }
+                    Tag::Table(_) => {
+                        out.flush();
+                        table.clear();
+                    }
+                    Tag::TableHead | Tag::TableRow => table.push(Vec::new()),
                     _ => {}
                 }
-                tag_stack.push((pos, tag));
+                tag_stack.push((out.text.len(), tag));
             }
             Event::End(end_tag) => {
-                if let Some((start_offset, tag)) = tag_stack.pop() {
-                    if end_tag != tag.to_end() {
-                        tracing::warn!("Mismatched markdown tag");
-                        continue;
-                    }
+                let Some((start_offset, tag)) = tag_stack.pop() else {
+                    tracing::warn!("Unbalanced markdown tag");
+                    continue;
+                };
+                if end_tag != tag.to_end() {
+                    tracing::warn!("Mismatched markdown tag");
+                    continue;
+                }
 
-                    // Code blocks become their own item, splitting the text
-                    if let Tag::CodeBlock(kind) = &tag {
-                        let code = current_text[start_offset..]
+                // Tags that end an item of their own
+                match &tag {
+                    Tag::CodeBlock(kind) => {
+                        let code = out.text[start_offset..]
                             .trim_end_matches('\n')
                             .to_string();
-                        current_text.truncate(start_offset);
-                        flush_text(
-                            &mut res,
-                            &mut current_text,
-                            &mut attr_list,
-                            &default_attrs,
-                        );
-                        pos = 0;
-                        builder_dirty = false;
-                        add_newlines = 0;
+                        out.text.truncate(start_offset);
+                        out.flush();
 
                         let language = match kind {
                             CodeBlockKind::Fenced(info) => {
@@ -143,119 +208,109 @@ pub fn parse_markdown(
                         );
                         let mut layout = TextLayout::new();
                         layout.set_text(&code, code_attr_list, None);
-                        res.push(MarkdownContent::CodeBlock {
+                        out.res.push(MarkdownContent::CodeBlock {
                             layout,
                             language: language.to_string(),
                             code,
                         });
                         continue;
                     }
-
-                    if let Some(attrs) = attribute_for_tag(
-                        default_attrs.clone(),
-                        &tag,
-                        &code_font_family,
-                        config,
-                    ) {
-                        attr_list
-                            .add_span(start_offset..pos.max(start_offset), attrs);
+                    Tag::Item => {
+                        out.flush();
+                        continue;
                     }
-
-                    if matches!(tag, Tag::List(_)) {
-                        lists.pop();
-                    }
-                    let in_item =
-                        tag_stack.iter().any(|(_, tag)| matches!(tag, Tag::Item));
-                    add_newlines =
-                        add_newlines.max(newlines_after_tag(&tag, in_item));
-
-                    match &tag {
-                        Tag::Image {
-                            link_type: _,
-                            dest_url: dest,
-                            title,
-                            id: _,
-                        } => {
-                            // TODO: Are there any link types that would change how the
-                            // image is rendered?
-
-                            if builder_dirty {
-                                let mut text_layout = TextLayout::new();
-                                text_layout.set_text(&current_text, attr_list, None);
-                                res.push(MarkdownContent::Text(text_layout));
-                                attr_list = AttrsList::new(default_attrs.clone());
-                                current_text.clear();
-                                pos = 0;
-                                builder_dirty = false;
-                            }
-
-                            res.push(MarkdownContent::Image {
-                                url: dest.to_string(),
-                                title: title.to_string(),
-                            });
+                    Tag::TableCell => {
+                        let in_head = tag_stack
+                            .iter()
+                            .any(|(_, tag)| matches!(tag, Tag::TableHead));
+                        if in_head {
+                            let bold = default_attrs.clone().weight(Weight::BOLD);
+                            out.attrs.add_span(0..out.text.len(), bold);
                         }
-                        _ => {
-                            // Presumably?
-                            builder_dirty = true;
+                        let cell =
+                            out.take_layout().unwrap_or_else(TextLayout::new);
+                        if let Some(row) = table.last_mut() {
+                            row.push(cell);
                         }
+                        continue;
                     }
-                } else {
-                    tracing::warn!("Unbalanced markdown tag")
+                    Tag::TableHead | Tag::TableRow => continue,
+                    Tag::Table(_) => {
+                        let rows = std::mem::take(&mut table);
+                        out.res.push(MarkdownContent::Table(rows));
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                if let Some(attrs) = attribute_for_tag(
+                    default_attrs.clone(),
+                    &tag,
+                    &code_font_family,
+                    config,
+                ) {
+                    let end = out.text.len().max(start_offset);
+                    out.attrs.add_span(start_offset..end, attrs);
+                }
+
+                if matches!(tag, Tag::List(_)) {
+                    lists.pop();
+                }
+                let in_item =
+                    tag_stack.iter().any(|(_, tag)| matches!(tag, Tag::Item));
+                add_newlines = add_newlines.max(newlines_after_tag(&tag, in_item));
+
+                // TODO: Are there any link types that would change how the
+                // image is rendered?
+                if let Tag::Image {
+                    dest_url, title, ..
+                } = &tag
+                {
+                    out.flush();
+                    out.res.push(MarkdownContent::Image {
+                        url: dest_url.to_string(),
+                        title: title.to_string(),
+                    });
                 }
             }
             Event::Text(text) => {
-                if let Some((_, tag)) = tag_stack.last() {
-                    if should_skip_text_in_tag(tag) {
-                        continue;
-                    }
+                if let Some((_, tag)) = tag_stack.last()
+                    && should_skip_text_in_tag(tag)
+                {
+                    continue;
                 }
-                current_text.push_str(&text);
-                pos += text.len();
-                builder_dirty = true;
+                out.text.push_str(&text);
             }
             Event::Code(text) => {
-                attr_list.add_span(
-                    pos..pos + text.len(),
+                let start = out.text.len();
+                out.text.push_str(&text);
+                out.attrs.add_span(
+                    start..out.text.len(),
                     default_attrs
                         .clone()
                         .family(&code_font_family)
                         .color(inline_code_color),
                 );
-                current_text.push_str(&text);
-                pos += text.len();
-                builder_dirty = true;
             }
             // TODO: Some minimal 'parsing' of html could be useful here, since some things use
             // basic html like `<code>text</code>`.
             Event::Html(text) => {
-                attr_list.add_span(
-                    pos..pos + text.len(),
+                let start = out.text.len();
+                out.text.push_str(&text);
+                out.attrs.add_span(
+                    start..out.text.len(),
                     default_attrs
                         .clone()
                         .family(&code_font_family)
                         .color(config.color(LapceColor::MARKDOWN_BLOCKQUOTE)),
                 );
-                current_text.push_str(&text);
-                pos += text.len();
-                builder_dirty = true;
             }
-            Event::HardBreak => {
-                current_text.push('\n');
-                pos += 1;
-                builder_dirty = true;
-            }
-            Event::SoftBreak => {
-                current_text.push(' ');
-                pos += 1;
-                builder_dirty = true;
-            }
+            Event::HardBreak => out.text.push('\n'),
+            Event::SoftBreak => out.text.push(' '),
             Event::Rule => {}
             Event::FootnoteReference(_text) => {}
             Event::TaskListMarker(checked) => {
-                let marker = if checked { "[x] " } else { "[ ] " };
-                current_text.push_str(marker);
-                pos += marker.len();
-                builder_dirty = true;
+                out.text.push_str(if checked { "[x] " } else { "[ ] " });
             }
             Event::InlineHtml(_) => {} // TODO(panekj): Implement
             Event::InlineMath(_) => {} // TODO(panekj): Implement
@@ -263,30 +318,47 @@ pub fn parse_markdown(
         }
     }
 
-    if builder_dirty {
-        let mut text_layout = TextLayout::new();
-        text_layout.set_text(&current_text, attr_list, None);
-        res.push(MarkdownContent::Text(text_layout));
-    }
-
-    res
+    out.flush();
+    out.res
 }
 
-/// Push the pending text as its own item, without trailing line breaks
-fn flush_text(
-    res: &mut Vec<MarkdownContent>,
-    text: &mut String,
-    attr_list: &mut AttrsList,
-    default_attrs: &Attrs,
-) {
-    let attrs = std::mem::replace(attr_list, AttrsList::new(default_attrs.clone()));
-    let trimmed = text.trim_end_matches('\n');
-    if !trimmed.is_empty() {
-        let mut layout = TextLayout::new();
-        layout.set_text(trimmed, attrs, None);
-        res.push(MarkdownContent::Text(layout));
-    }
-    text.clear();
+/// Marker then text, so wrapped lines line up after the marker
+pub fn list_item_view(
+    marker: TextLayout,
+    depth: usize,
+    layout: TextLayout,
+) -> impl View {
+    stack((
+        rich_text(move || marker.clone())
+            .style(|s| s.min_width(14.0).margin_right(6.0)),
+        rich_text(move || layout.clone())
+            .style(|s| s.flex_grow(1.0f32).flex_basis(0.0).min_width(0.0)),
+    ))
+    .style(move |s| s.width_full().padding_left(depth as f64 * 20.0))
+}
+
+/// Cells on a grid, each column as wide as its content allows, rows ruled
+pub fn table_view(rows: Vec<Vec<TextLayout>>, border: Color) -> impl View {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let cells = rows.into_iter().flat_map(move |row| {
+        let missing = columns - row.len();
+        row.into_iter()
+            .chain(std::iter::repeat_with(TextLayout::new).take(missing))
+    });
+    let tracks: Vec<TrackSizingFunction> = vec![auto(); columns];
+    stack_from_iter(cells.map(move |cell| {
+        rich_text(move || cell.clone()).style(move |s| {
+            s.padding_horiz(8.0)
+                .padding_vert(3.0)
+                .border_bottom(1.0)
+                .border_color(border)
+        })
+    }))
+    .style(move |s| {
+        s.grid()
+            .grid_template_columns(tracks.clone())
+            .max_width_full()
+    })
 }
 
 fn attribute_for_tag<'a>(
@@ -303,15 +375,14 @@ fn attribute_for_tag<'a>(
             classes: _,
             attrs: _,
         } => {
-            // The size calculations are based on the em values given at
-            // https://drafts.csswg.org/css2/#html-stylesheet
+            // Smaller than the em values of
+            // https://drafts.csswg.org/css2/#html-stylesheet, those crowd
+            // narrow panels and popups
             let font_scale = match level {
-                HeadingLevel::H1 => 2.0,
-                HeadingLevel::H2 => 1.5,
-                HeadingLevel::H3 => 1.17,
-                HeadingLevel::H4 => 1.0,
-                HeadingLevel::H5 => 0.83,
-                HeadingLevel::H6 => 0.75,
+                HeadingLevel::H1 => 1.4,
+                HeadingLevel::H2 => 1.25,
+                HeadingLevel::H3 => 1.1,
+                _ => 1.0,
             };
             let font_size = font_scale * config.ui.font_size() as f64;
             Some(
@@ -446,47 +517,75 @@ pub fn from_plaintext(
 
 #[cfg(test)]
 mod tests {
+    use floem::text::TextLayout;
+
     use super::{MarkdownContent, parse_markdown};
     use crate::config::LapceConfig;
 
+    fn text(layout: &TextLayout) -> String {
+        let lines: Vec<_> = layout.lines().iter().map(|line| line.text()).collect();
+        lines.join("\n")
+    }
+
+    /// One line per item: list items indented with their marker, code blocks
+    /// as their fence and table rows with cells split by `|`
     fn rendered(markdown: &str) -> String {
         let config = LapceConfig::default_lapce_config();
-        parse_markdown(markdown, 1.5, &config)
-            .into_iter()
-            .filter_map(|content| match content {
-                MarkdownContent::Text(layout) => Some(
-                    layout
-                        .lines()
+        let items: Vec<_> = parse_markdown(markdown, 1.5, &config)
+            .iter()
+            .map(|content| match content {
+                MarkdownContent::Text(layout) => text(layout),
+                MarkdownContent::ListItem {
+                    marker,
+                    depth,
+                    layout,
+                } => {
+                    let indent = "  ".repeat(*depth);
+                    format!("{indent}{} {}", text(marker), text(layout))
+                }
+                MarkdownContent::CodeBlock { language, code, .. } => {
+                    format!("```{language} {code}")
+                }
+                MarkdownContent::Table(rows) => {
+                    let rows: Vec<_> = rows
                         .iter()
-                        .map(|line| line.text())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-                _ => None,
+                        .map(|row| {
+                            row.iter().map(text).collect::<Vec<_>>().join("|")
+                        })
+                        .collect();
+                    rows.join("\n")
+                }
+                MarkdownContent::Image { .. } => "image".to_string(),
+                MarkdownContent::Separator => "---".to_string(),
             })
-            .collect()
+            .collect();
+        items.join("\n")
     }
 
     #[test]
-    fn blocks_and_lists() {
+    fn paragraphs_keep_a_blank_line() {
         assert_eq!(rendered("a\n\nb"), "a\n\nb");
-        assert_eq!(rendered("- x\n- y\n\nz"), "• x\n• y\n\nz");
+    }
+
+    #[test]
+    fn list_items_are_their_own_items() {
+        assert_eq!(rendered("intro\n\n- x\n- y\n\nz"), "intro\n• x\n• y\nz");
         assert_eq!(rendered("3. x\n4. y"), "3. x\n4. y");
-        assert_eq!(rendered("- x\n  - y\n- z"), "• x\n    • y\n• z");
+        assert_eq!(rendered("- x\n  - y\n- z"), "• x\n  • y\n• z");
         assert_eq!(rendered("- [x] done"), "• [x] done");
+        // Loose items, paragraphs inside one item stay together
+        assert_eq!(rendered("- a\n\n  b\n\n- c"), "• a\nb\n• c");
     }
 
     #[test]
     fn code_block_is_its_own_item() {
-        let config = LapceConfig::default_lapce_config();
         let markdown = "a\n\n```rust title\nfn x() {}\n```\n\nb";
-        let content = parse_markdown(markdown, 1.5, &config);
-        assert_eq!(content.len(), 3);
-        let MarkdownContent::CodeBlock { language, code, .. } = &content[1] else {
-            panic!("expected a code block");
-        };
-        assert_eq!(language, "rust");
-        assert_eq!(code, "fn x() {}");
-        assert_eq!(rendered("a\n\n```\nx\n```\n\nb"), "ab");
+        assert_eq!(rendered(markdown), "a\n```rust fn x() {}\nb");
+    }
+
+    #[test]
+    fn table_rows_and_cells() {
+        let markdown = "| a | b |\n|---|---|\n| 1 | `2` |\n| 3 |\n\nafter";
+        assert_eq!(rendered(markdown), "a|b\n1|2\n3|\nafter");
     }
 }

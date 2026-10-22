@@ -93,7 +93,7 @@ use crate::{
     main_split::{
         SplitContent, SplitData, SplitDirection, SplitMoveDirection, TabCloseKind,
     },
-    markdown::MarkdownContent,
+    markdown::{MarkdownContent, list_item_view, table_view},
     palette::{
         PaletteStatus,
         item::{PaletteItem, PaletteItemContent},
@@ -3089,6 +3089,18 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
                     rich_text(move || layout.clone()).style(|s| s.max_width(600.0)),
                 )
                 .style(|s| s.max_width_full().padding_vert(4.0)),
+                MarkdownContent::ListItem {
+                    marker,
+                    depth,
+                    layout,
+                } => container(list_item_view(marker, depth, layout))
+                    .style(|s| s.max_width(600.0)),
+                MarkdownContent::Table(rows) => {
+                    let border =
+                        config.get_untracked().color(LapceColor::LAPCE_BORDER);
+                    container(table_view(rows, border))
+                        .style(|s| s.max_width(600.0).padding_vert(4.0))
+                }
                 MarkdownContent::Image { .. } => container(empty()),
                 MarkdownContent::Separator => container(empty().style(move |s| {
                     s.width_full()
