@@ -4,7 +4,10 @@ use floem::{
     IntoView, View,
     kurbo::Point,
     peniko::Color,
-    taffy::{prelude::auto, style::TrackSizingFunction},
+    taffy::{
+        prelude::{auto, length, minmax},
+        style::TrackSizingFunction,
+    },
     text::{
         Attrs, AttrsList, FamilyOwned, LineHeightValue, Style, TextLayout, Weight,
     },
@@ -397,7 +400,10 @@ pub fn table_view(rows: Vec<Vec<TextLayout>>, border: Color) -> impl View {
         row.into_iter()
             .chain(std::iter::repeat_with(TextLayout::new).take(missing))
     });
-    let tracks: Vec<TrackSizingFunction> = vec![auto(); columns];
+    // Cells measure at their unwrapped width, a zero minimum lets columns
+    // shrink to the available width so the cells wrap instead of overflowing
+    let tracks: Vec<TrackSizingFunction> =
+        vec![minmax(length(0.0), auto()); columns];
     stack_from_iter(cells.map(move |cell| {
         rich_text(move || cell.clone()).style(move |s| {
             s.padding_horiz(8.0)
