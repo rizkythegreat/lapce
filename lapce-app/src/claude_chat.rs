@@ -157,9 +157,7 @@ pub struct UsageWindow {
 struct ChatProcess {
     child: Child,
     stdin: ChildStdin,
-    /// Started with `--dangerously-skip-permissions`
-    skip_permissions: bool,
-    model: Option<String>,
+    /// `--effort` is only read at start, model and permission mode change live
     effort: Option<String>,
 }
 
@@ -361,14 +359,13 @@ impl ClaudeChatData {
         self.suggestion.set(None);
         self.push(ChatRole::User, text.to_string());
 
-        // Permission mode, model and effort are fixed at spawn, restart (and
-        // resume) when one changes
-        let skip = self.skip_permissions.get_untracked();
-        let model = self.model.get_untracked();
+        // Effort is fixed at spawn, restart (and resume) when it changes
         let effort = self.effort.get_untracked();
-        let stale = self.process.borrow().as_ref().is_some_and(|p| {
-            p.skip_permissions != skip || p.model != model || p.effort != effort
-        });
+        let stale = self
+            .process
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| p.effort != effort);
         if stale {
             self.stop();
         }
@@ -528,15 +525,47 @@ impl ClaudeChatData {
             .with(|models| models.iter().find(|m| m.value == value).cloned())
     }
 
-    /// Drops the effort level when the new model does not take it
+    /// Switches the running process too. Drops the effort level when the new
+    /// model does not take it.
     pub fn set_model(&self, model: Option<String>) {
+        let value = model.clone().unwrap_or_else(|| "default".to_string());
         self.model.set(model);
+        self.control(
+            "lapce-set-model",
+            json!({ "subtype": "set_model", "model": value }),
+        );
         let efforts = self.current_model().map(|m| m.efforts).unwrap_or_default();
         if self
             .effort
             .with_untracked(|e| e.as_ref().is_some_and(|e| !efforts.contains(e)))
         {
             self.effort.set(None);
+        }
+    }
+
+    /// Switches the running process too, it was started allowing the bypass
+    pub fn set_skip_permissions(&self, skip: bool) {
+        self.skip_permissions.set(skip);
+        let mode = if skip { "bypassPermissions" } else { "default" };
+        self.control(
+            "lapce-permission-mode",
+            json!({ "subtype": "set_permission_mode", "mode": mode }),
+        );
+    }
+
+    /// Sends a control request when a process runs, a later spawn reads the
+    /// signals instead
+    fn control(&self, request_id: &str, request: Value) {
+        if self.process.borrow().is_none() {
+            return;
+        }
+        let line = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": request,
+        });
+        if let Err(e) = self.write_line(&line) {
+            self.push(ChatRole::Error, format!("Failed to send: {e}"));
         }
     }
 
@@ -700,9 +729,10 @@ impl ClaudeChatData {
             "--prompt-suggestions",
             "true",
         ]);
-        let skip_permissions = self.skip_permissions.get_untracked();
-        if skip_permissions {
-            cmd.arg("--dangerously-skip-permissions");
+        // Lets the permission toggle switch to bypass without a restart
+        cmd.arg("--allow-dangerously-skip-permissions");
+        if self.skip_permissions.get_untracked() {
+            cmd.args(["--permission-mode", "bypassPermissions"]);
         }
         let model = self.model.get_untracked();
         if let Some(model) = &model {
@@ -755,8 +785,6 @@ impl ClaudeChatData {
         *self.process.borrow_mut() = Some(ChatProcess {
             child,
             stdin,
-            skip_permissions,
-            model,
             effort,
         });
         // Ask for the slash commands, answered without an API request
@@ -813,6 +841,19 @@ impl ClaudeChatData {
                 if let Some(usage) = parse_usage(&event["response"]["response"]) {
                     self.usage.set(Some(usage));
                 }
+            }
+            // Only the switches report, a failed usage or command list
+            // request stays quiet
+            Some("control_response")
+                if event["response"]["subtype"] == "error"
+                    && matches!(
+                        event["response"]["request_id"].as_str(),
+                        Some("lapce-set-model" | "lapce-permission-mode")
+                    ) =>
+            {
+                let error = event["response"]["error"].as_str();
+                let error = error.unwrap_or("Claude Code refused a request");
+                self.push(ChatRole::Error, error.to_string());
             }
             Some("control_response") => {
                 let response = &event["response"]["response"];

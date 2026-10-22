@@ -309,8 +309,8 @@ fn text_button<S: std::fmt::Display + 'static>(
 }
 
 /// Bottom row of the input box: permission mode, model and effort on the
-/// left, slash commands and send on the right. Mode, model and effort apply
-/// from the next message, the process restarts on the same session.
+/// left, slash commands and send on the right. Mode and model switch right
+/// away, effort restarts the process on the same session at the next message.
 fn input_toolbar(
     chat: ClaudeChatData,
     config: ReadSignal<Arc<LapceConfig>>,
@@ -322,13 +322,15 @@ fn input_toolbar(
         name.to_string()
     };
     let slash_chat = chat.clone();
+    let mode_chat = chat.clone();
     stack((
         container(text_button(
             move || mode(skip.get()),
             move || {
                 let choices = vec![(false, mode(false)), (true, mode(true))];
+                let pick_chat = mode_chat.clone();
                 show_choice_menu(skip.get_untracked(), choices, move |v| {
-                    skip.set(v)
+                    pick_chat.set_skip_permissions(v)
                 })
             },
             config,
