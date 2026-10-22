@@ -2002,19 +2002,18 @@ impl DocumentPhantom for Doc {
 
         if config.editor.enable_inline_blame
             && self.blame_line.get_untracked() == Some(line)
+            && let Some(blame) = self.blame_text(line)
         {
-            if let Some(blame) = self.blame_text(line) {
-                text.push(PhantomText {
-                    kind: PhantomTextKind::Diagnostic,
-                    col: end_offset - start_offset,
-                    affinity: Some(CursorAffinity::Backward),
-                    text: blame,
-                    fg: Some(config.color(LapceColor::EDITOR_DIM)),
-                    font_size: Some(config.editor.inlay_hint_font_size()),
-                    bg: None,
-                    under_line: None,
-                });
-            }
+            text.push(PhantomText {
+                kind: PhantomTextKind::Diagnostic,
+                col: end_offset - start_offset,
+                affinity: Some(CursorAffinity::Backward),
+                text: blame,
+                fg: Some(config.color(LapceColor::EDITOR_DIM)),
+                font_size: Some(config.editor.inlay_hint_font_size()),
+                bg: None,
+                under_line: None,
+            });
         }
 
         let (completion_line, completion_col) = self.completion_pos.get_untracked();
