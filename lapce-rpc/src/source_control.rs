@@ -10,6 +10,25 @@ pub struct DiffInfo {
     pub diffs: Vec<FileDiff>,
 }
 
+/// Blame for a run of consecutive lines in the buffer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlameHunk {
+    /// 0-based first line
+    pub start_line: usize,
+    pub lines: usize,
+    /// `None` when the lines are not committed yet
+    pub commit: Option<BlameCommit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BlameCommit {
+    pub id: String,
+    pub author: String,
+    /// Unix seconds
+    pub time: i64,
+    pub summary: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum FileDiff {
     Modified(PathBuf),

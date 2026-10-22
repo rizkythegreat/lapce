@@ -227,6 +227,20 @@ pub fn editor_view(
         }
     });
 
+    create_effect({
+        let editor_cursor = e_data.cursor();
+        move |_| {
+            if !is_active.get() {
+                return;
+            }
+            let offset = editor_cursor.with(|c| c.offset());
+            doc.with(|doc| {
+                let line = doc.buffer.with_untracked(|b| b.line_of_offset(offset));
+                doc.set_blame_line(line);
+            });
+        }
+    });
+
     create_effect(move |_| {
         let highlights = doc.with(|doc| doc.highlights);
         highlights.track();

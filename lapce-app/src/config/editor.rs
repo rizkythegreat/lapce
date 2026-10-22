@@ -161,6 +161,11 @@ pub struct EditorConfig {
     pub enable_error_lens: bool,
 
     #[field_names(
+        desc = "If git blame of the cursor line should be displayed inline"
+    )]
+    pub enable_inline_blame: bool,
+
+    #[field_names(
         desc = "Only render the styling without displaying messages, provided that `Enable ErrorLens` is enabled"
     )]
     pub only_render_error_styling: bool,

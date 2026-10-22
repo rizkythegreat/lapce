@@ -60,6 +60,7 @@ use lapce_rpc::{
     buffer::BufferId,
     plugin::PluginId,
     proxy::ProxyResponse,
+    source_control::BlameHunk,
     style::{LineStyle, LineStyles, Style},
 };
 use lapce_xi_rope::{
@@ -219,6 +220,10 @@ pub struct Doc {
     semantic_styles: RwSignal<Option<Spans<Style>>>,
     /// Inlay hints for the document
     pub inlay_hints: RwSignal<Option<Spans<InlayHint>>>,
+    /// Git blame of the buffer, tagged with the buffer rev it was computed for
+    blame: RwSignal<Option<(u64, Vec<BlameHunk>)>>,
+    /// Line the inline blame is shown on (the active editor's cursor line)
+    blame_line: RwSignal<Option<usize>>,
     /// Current completion lens text, if any.
     /// This will be displayed even on views that are not focused.
     pub completion_lens: RwSignal<Option<String>>,
@@ -287,6 +292,8 @@ impl Doc {
             ))),
             semantic_styles: cx.create_rw_signal(None),
             inlay_hints: cx.create_rw_signal(None),
+            blame: cx.create_rw_signal(None),
+            blame_line: cx.create_rw_signal(None),
             diagnostics,
             completion_lens: cx.create_rw_signal(None),
             completion_pos: cx.create_rw_signal((0, 0)),
@@ -340,6 +347,8 @@ impl Doc {
             ))),
             semantic_styles: cx.create_rw_signal(None),
             inlay_hints: cx.create_rw_signal(None),
+            blame: cx.create_rw_signal(None),
+            blame_line: cx.create_rw_signal(None),
             diagnostics: DiagnosticData {
                 expanded: cx.create_rw_signal(true),
                 diagnostics: cx.create_rw_signal(im::Vector::new()),
@@ -394,6 +403,8 @@ impl Doc {
             ))),
             semantic_styles: cx.create_rw_signal(None),
             inlay_hints: cx.create_rw_signal(None),
+            blame: cx.create_rw_signal(None),
+            blame_line: cx.create_rw_signal(None),
             diagnostics: DiagnosticData {
                 expanded: cx.create_rw_signal(true),
                 diagnostics: cx.create_rw_signal(im::Vector::new()),
@@ -1413,6 +1424,61 @@ impl Doc {
                 });
             });
         }
+        self.get_blame();
+    }
+
+    pub fn get_blame(&self) {
+        if !self.common.config.get_untracked().editor.enable_inline_blame {
+            return;
+        }
+        let DocContent::File { path, .. } = self.content.get_untracked() else {
+            return;
+        };
+        let doc = self.clone();
+        let send = create_ext_action(self.scope, move |result| {
+            if let Ok(ProxyResponse::GitBlameResponse { rev, hunks }) = result {
+                doc.blame.set(Some((rev, hunks)));
+                doc.clear_text_cache();
+            }
+        });
+        self.common.proxy.git_blame(path, move |result| {
+            send(result);
+        });
+    }
+
+    pub fn set_blame_line(&self, line: usize) {
+        if self.blame_line.get_untracked() == Some(line) {
+            return;
+        }
+        self.blame_line.set(Some(line));
+        if self.blame.with_untracked(Option::is_some) {
+            // ponytail: relayouts every visible line, invalidate only the
+            // old and new line if this shows up in profiles
+            self.clear_text_cache();
+        }
+    }
+
+    /// Inline blame text for `line`, if the blame is still valid for the buffer
+    fn blame_text(&self, line: usize) -> Option<String> {
+        let rev = self.rev();
+        self.blame.with_untracked(|blame| {
+            let (blame_rev, hunks) = blame.as_ref()?;
+            if *blame_rev != rev {
+                return None;
+            }
+            let hunk = hunks.iter().find(|h| {
+                line >= h.start_line && line < h.start_line + h.lines
+            })?;
+            Some(match &hunk.commit {
+                Some(c) => format!(
+                    "    {}, {} • {}",
+                    c.author,
+                    relative_time(chrono::Utc::now().timestamp() - c.time),
+                    c.summary
+                ),
+                None => "    Uncommitted changes".to_string(),
+            })
+        })
     }
 
     pub fn trigger_head_change(&self) {
@@ -1463,6 +1529,7 @@ impl Doc {
         if let DocContent::File { path, .. } = content {
             let rev = self.rev();
             let buffer = self.buffer;
+            let doc = self.clone();
             let send = create_ext_action(self.scope, move |result| {
                 if let Ok(ProxyResponse::SaveResponse {}) = result {
                     let current_rev = buffer.with_untracked(|buffer| buffer.rev());
@@ -1470,6 +1537,7 @@ impl Doc {
                         buffer.update(|buffer| {
                             buffer.set_pristine();
                         });
+                        doc.get_blame();
                         after_action();
                     }
                 }
@@ -1932,6 +2000,23 @@ impl DocumentPhantom for Doc {
 
         text.append(&mut diag_text);
 
+        if config.editor.enable_inline_blame
+            && self.blame_line.get_untracked() == Some(line)
+        {
+            if let Some(blame) = self.blame_text(line) {
+                text.push(PhantomText {
+                    kind: PhantomTextKind::Diagnostic,
+                    col: end_offset - start_offset,
+                    affinity: Some(CursorAffinity::Backward),
+                    text: blame,
+                    fg: Some(config.color(LapceColor::EDITOR_DIM)),
+                    font_size: Some(config.editor.inlay_hint_font_size()),
+                    bg: None,
+                    under_line: None,
+                });
+            }
+        }
+
         let (completion_line, completion_col) = self.completion_pos.get_untracked();
         let completion_text = config
             .editor
@@ -2384,4 +2469,32 @@ fn extra_styles_for_range(
                 wave_line,
             })
         })
+}
+
+/// "3 days ago" style age for a duration in seconds
+fn relative_time(secs: i64) -> String {
+    let (n, unit) = match secs {
+        ..60 => return "just now".to_string(),
+        ..3_600 => (secs / 60, "minute"),
+        ..86_400 => (secs / 3_600, "hour"),
+        ..2_592_000 => (secs / 86_400, "day"),
+        ..31_536_000 => (secs / 2_592_000, "month"),
+        _ => (secs / 31_536_000, "year"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod blame_tests {
+    use super::relative_time;
+
+    #[test]
+    fn relative_time_units() {
+        assert_eq!(relative_time(-5), "just now");
+        assert_eq!(relative_time(59), "just now");
+        assert_eq!(relative_time(60), "1 minute ago");
+        assert_eq!(relative_time(7_200), "2 hours ago");
+        assert_eq!(relative_time(86_400 * 3), "3 days ago");
+        assert_eq!(relative_time(31_536_000 * 2), "2 years ago");
+    }
 }

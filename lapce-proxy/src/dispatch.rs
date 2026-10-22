@@ -30,7 +30,7 @@ use lapce_rpc::{
         ProxyHandler, ProxyNotification, ProxyRequest, ProxyResponse,
         ProxyRpcHandler, SearchMatch,
     },
-    source_control::{DiffInfo, FileDiff},
+    source_control::{BlameCommit, BlameHunk, DiffInfo, FileDiff},
     style::{LineStyle, SemanticStyles},
     terminal::TermId,
 };
@@ -546,6 +546,33 @@ impl ProxyHandler for Dispatcher {
                         Err(e) => eprintln!("{e:?}"),
                     }
                 }
+            }
+            GitBlame { path } => {
+                let (Some(workspace), Some(buffer)) =
+                    (self.workspace.clone(), self.buffers.get(&path))
+                else {
+                    self.respond_rpc(
+                        id,
+                        Err(RpcError {
+                            code: 0,
+                            message: "no workspace or buffer".to_string(),
+                        }),
+                    );
+                    return;
+                };
+                let rev = buffer.rev;
+                let content = buffer.get_document();
+                let proxy_rpc = self.proxy_rpc.clone();
+                // Blame walks history, keep it off the dispatch thread
+                thread::spawn(move || {
+                    let result = git_blame(&workspace, &path, content.as_bytes())
+                        .map(|hunks| ProxyResponse::GitBlameResponse { rev, hunks })
+                        .map_err(|e| RpcError {
+                            code: 0,
+                            message: e.to_string(),
+                        });
+                    proxy_rpc.handle_response(id, result);
+                });
             }
             GetDefinition {
                 request_id,
@@ -1668,6 +1695,46 @@ fn file_get_head(workspace_path: &Path, path: &Path) -> Result<(String, String)>
         .with_context(|| "content bytes to string")?
         .to_string();
     Ok((id, content))
+}
+
+/// Blame `content` (the live buffer) on top of the file's history at HEAD.
+/// Lines that differ from HEAD come back with `commit: None`.
+fn git_blame(
+    workspace_path: &Path,
+    path: &Path,
+    content: &[u8],
+) -> Result<Vec<BlameHunk>> {
+    let repo = Repository::discover(workspace_path)?;
+    let workdir = repo.workdir().ok_or(anyhow!("bare repository"))?;
+    let blame = repo.blame_file(path.strip_prefix(workdir)?, None)?;
+    let blame = blame.blame_buffer(content)?;
+
+    let mut commits: HashMap<Oid, BlameCommit> = HashMap::new();
+    let mut hunks = Vec::new();
+    for hunk in blame.iter() {
+        let oid = hunk.final_commit_id();
+        let commit = if oid.is_zero() {
+            None
+        } else if let Some(commit) = commits.get(&oid) {
+            Some(commit.clone())
+        } else {
+            let c = repo.find_commit(oid)?;
+            let commit = BlameCommit {
+                id: oid.to_string(),
+                author: c.author().name().unwrap_or_default().to_string(),
+                time: c.time().seconds(),
+                summary: c.summary().unwrap_or_default().to_string(),
+            };
+            commits.insert(oid, commit.clone());
+            Some(commit)
+        };
+        hunks.push(BlameHunk {
+            start_line: hunk.final_start_line().saturating_sub(1),
+            lines: hunk.lines_in_hunk(),
+            commit,
+        });
+    }
+    Ok(hunks)
 }
 
 fn git_get_remote_file_url(workspace_path: &Path, file: &Path) -> Result<String> {
