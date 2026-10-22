@@ -3080,7 +3080,7 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
             move || hover_data.content.get(),
             move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             move |content| match content {
-                MarkdownContent::Text(text_layout) => container(
+                MarkdownContent::Text(text_layout, _) => container(
                     rich_text(move || text_layout.clone())
                         .style(|s| s.max_width(600.0)),
                 )
@@ -3093,8 +3093,13 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
                     marker,
                     depth,
                     layout,
-                } => container(list_item_view(marker, depth, layout))
-                    .style(|s| s.max_width(600.0)),
+                    ..
+                } => container(list_item_view(
+                    marker,
+                    depth,
+                    rich_text(move || layout.clone()).style(|s| s.width_full()),
+                ))
+                .style(|s| s.max_width(600.0)),
                 MarkdownContent::Table(rows) => {
                     let border =
                         config.get_untracked().color(LapceColor::LAPCE_BORDER);

@@ -1,11 +1,14 @@
+use std::ops::Range;
+
 use floem::{
-    View,
+    IntoView, View,
+    kurbo::Point,
     peniko::Color,
     taffy::{prelude::auto, style::TrackSizingFunction},
     text::{
         Attrs, AttrsList, FamilyOwned, LineHeightValue, Style, TextLayout, Weight,
     },
-    views::{Decorators, rich_text, stack, stack_from_iter},
+    views::{Decorators, container, rich_text, stack, stack_from_iter},
 };
 use lapce_core::{language::LapceLanguage, syntax::Syntax};
 use lapce_xi_rope::Rope;
@@ -15,15 +18,25 @@ use smallvec::SmallVec;
 
 use crate::config::{LapceConfig, color::LapceColor};
 
+/// A link or inline code in a text layout, by byte range of the layout's
+/// text with lines joined by `\n`. Inline code may name a file, its target
+/// is the code itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Link {
+    pub range: Range<usize>,
+    pub target: String,
+}
+
 #[derive(Clone)]
 pub enum MarkdownContent {
-    Text(TextLayout),
+    Text(TextLayout, Vec<Link>),
     /// A list item's text, its bullet or number kept apart so wrapped lines
     /// line up after it. `depth` is 0 in a top level list.
     ListItem {
         marker: TextLayout,
         depth: usize,
         layout: TextLayout,
+        links: Vec<Link>,
     },
     /// Highlighted code, `language` is the fence info's first word
     CodeBlock {
@@ -43,6 +56,7 @@ struct Builder<'a> {
     text: String,
     attrs: AttrsList,
     default_attrs: Attrs<'a>,
+    links: Vec<Link>,
     /// Marker and depth of the list item the text belongs to
     item: Option<(String, usize)>,
 }
@@ -54,16 +68,19 @@ impl<'a> Builder<'a> {
             text: String::new(),
             attrs: AttrsList::new(default_attrs.clone()),
             default_attrs,
+            links: Vec::new(),
             item: None,
         }
     }
 
-    /// The collected text without trailing line breaks, None when empty
-    fn take_layout(&mut self) -> Option<TextLayout> {
+    /// The collected text without trailing line breaks and its links, None
+    /// when empty
+    fn take_layout(&mut self) -> Option<(TextLayout, Vec<Link>)> {
         let attrs = std::mem::replace(
             &mut self.attrs,
             AttrsList::new(self.default_attrs.clone()),
         );
+        let links = std::mem::take(&mut self.links);
         let text = std::mem::take(&mut self.text);
         let text = text.trim_end_matches('\n');
         if text.is_empty() {
@@ -71,11 +88,11 @@ impl<'a> Builder<'a> {
         }
         let mut layout = TextLayout::new();
         layout.set_text(text, attrs, None);
-        Some(layout)
+        Some((layout, links))
     }
 
     fn flush(&mut self) {
-        let Some(layout) = self.take_layout() else {
+        let Some((layout, links)) = self.take_layout() else {
             return;
         };
         let content = match self.item.take() {
@@ -90,9 +107,10 @@ impl<'a> Builder<'a> {
                     marker: marker_layout,
                     depth,
                     layout,
+                    links,
                 }
             }
-            None => MarkdownContent::Text(layout),
+            None => MarkdownContent::Text(layout, links),
         };
         self.res.push(content);
     }
@@ -227,8 +245,10 @@ pub fn parse_markdown(
                             let bold = default_attrs.clone().weight(Weight::BOLD);
                             out.attrs.add_span(0..out.text.len(), bold);
                         }
-                        let cell =
-                            out.take_layout().unwrap_or_else(TextLayout::new);
+                        let cell = out
+                            .take_layout()
+                            .map(|(layout, _)| layout)
+                            .unwrap_or_else(TextLayout::new);
                         if let Some(row) = table.last_mut() {
                             row.push(cell);
                         }
@@ -253,6 +273,12 @@ pub fn parse_markdown(
                     out.attrs.add_span(start_offset..end, attrs);
                 }
 
+                if let Tag::Link { dest_url, .. } = &tag {
+                    out.links.push(Link {
+                        range: start_offset..out.text.len(),
+                        target: dest_url.to_string(),
+                    });
+                }
                 if matches!(tag, Tag::List(_)) {
                     lists.pop();
                 }
@@ -284,6 +310,10 @@ pub fn parse_markdown(
             Event::Code(text) => {
                 let start = out.text.len();
                 out.text.push_str(&text);
+                out.links.push(Link {
+                    range: start..out.text.len(),
+                    target: text.to_string(),
+                });
                 out.attrs.add_span(
                     start..out.text.len(),
                     default_attrs
@@ -322,19 +352,41 @@ pub fn parse_markdown(
     out.res
 }
 
-/// Marker then text, so wrapped lines line up after the marker
+/// Marker then text, so wrapped lines line up after the marker. `text` is
+/// given its share of the width, it should fill it.
 pub fn list_item_view(
     marker: TextLayout,
     depth: usize,
-    layout: TextLayout,
+    text: impl IntoView + 'static,
 ) -> impl View {
     stack((
         rich_text(move || marker.clone())
             .style(|s| s.min_width(14.0).margin_right(6.0)),
-        rich_text(move || layout.clone())
+        container(text)
             .style(|s| s.flex_grow(1.0f32).flex_basis(0.0).min_width(0.0)),
     ))
     .style(move |s| s.width_full().padding_left(depth as f64 * 20.0))
+}
+
+/// The link under `point`, relative to the layout's origin
+pub fn link_at<'a>(
+    layout: &TextLayout,
+    links: &'a [Link],
+    point: Point,
+) -> Option<&'a Link> {
+    if links.is_empty() {
+        return None;
+    }
+    let hit = layout.hit_point(point);
+    if !hit.is_inside {
+        return None;
+    }
+    let line_start: usize = layout.lines()[..hit.line]
+        .iter()
+        .map(|line| line.text().len() + 1)
+        .sum();
+    let offset = line_start + hit.index;
+    links.iter().find(|link| link.range.contains(&offset))
 }
 
 /// Cells on a grid, each column as wide as its content allows, rows ruled
@@ -512,7 +564,7 @@ pub fn from_plaintext(
         ),
         None,
     );
-    vec![MarkdownContent::Text(text_layout)]
+    vec![MarkdownContent::Text(text_layout, Vec::new())]
 }
 
 #[cfg(test)]
@@ -534,11 +586,12 @@ mod tests {
         let items: Vec<_> = parse_markdown(markdown, 1.5, &config)
             .iter()
             .map(|content| match content {
-                MarkdownContent::Text(layout) => text(layout),
+                MarkdownContent::Text(layout, _) => text(layout),
                 MarkdownContent::ListItem {
                     marker,
                     depth,
                     layout,
+                    ..
                 } => {
                     let indent = "  ".repeat(*depth);
                     format!("{indent}{} {}", text(marker), text(layout))
@@ -587,5 +640,23 @@ mod tests {
     fn table_rows_and_cells() {
         let markdown = "| a | b |\n|---|---|\n| 1 | `2` |\n| 3 |\n\nafter";
         assert_eq!(rendered(markdown), "a|b\n1|2\n3|\nafter");
+    }
+
+    #[test]
+    fn links_and_inline_code() {
+        let config = LapceConfig::default_lapce_config();
+        let markdown = "See [docs](https://a.dev) and `src/main.rs:3`";
+        let content = parse_markdown(markdown, 1.5, &config);
+        let [MarkdownContent::Text(_, links)] = content.as_slice() else {
+            panic!("expected one text");
+        };
+        let links: Vec<_> = links
+            .iter()
+            .map(|link| (link.range.clone(), link.target.as_str()))
+            .collect();
+        assert_eq!(
+            links,
+            [(4..8, "https://a.dev"), (13..26, "src/main.rs:3")]
+        );
     }
 }

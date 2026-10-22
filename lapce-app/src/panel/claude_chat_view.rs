@@ -35,8 +35,11 @@ use crate::{
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     doc::relative_time,
+    editor::location::{EditorLocation, EditorPosition},
     listener::Listener,
-    markdown::{MarkdownContent, list_item_view, parse_markdown, table_view},
+    markdown::{
+        Link, MarkdownContent, link_at, list_item_view, parse_markdown, table_view,
+    },
     panel::data::PanelData,
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
@@ -84,7 +87,7 @@ pub fn claude_chat_panel(
     stack((
         header(chat.clone(), window_tab_data.panel.clone(), config),
         sessions_view(chat.clone(), config),
-        container(
+        stack((
             scroll(
                 dyn_stack(
                     move || messages.get(),
@@ -114,7 +117,8 @@ pub fn claude_chat_panel(
                 }
             })
             .style(|s| s.absolute().size_pct(100.0, 100.0)),
-        )
+            empty_state(chat.clone(), config),
+        ))
         .style(move |s| {
             s.width_full()
                 .flex_grow(1.0f32)
@@ -637,8 +641,12 @@ fn message_view(
     let role = msg.role;
     let first_in_turn = msg.first_in_turn;
     let turn_label = if role == ChatRole::User { "You" } else { "Claude" };
+    let opener = LinkOpener {
+        workspace: workspace.clone(),
+        internal_command,
+    };
     let body = match role {
-        ChatRole::User => container(text_view(msg.text, role, config))
+        ChatRole::User => container(text_view(msg.text, role, opener, config))
             .style(move |s| {
                 let bg = config.get().color(LapceColor::PANEL_CURRENT_BACKGROUND);
                 s.max_width_pct(85.0)
@@ -651,7 +659,7 @@ fn message_view(
         ChatRole::Assistant => {
             let text = msg.text;
             stack((
-                text_view(text, role, config),
+                text_view(text, role, opener, config),
                 copy_button(move || text.get_untracked(), config),
             ))
             .style(|s| s.flex_col().width_full().items_start().gap(2.0))
@@ -660,7 +668,7 @@ fn message_view(
         ChatRole::Tool => {
             tool_card(msg, workspace, internal_command, config).into_any()
         }
-        ChatRole::Error => container(text_view(msg.text, role, config))
+        ChatRole::Error => container(text_view(msg.text, role, opener, config))
             .style(move |s| {
                 s.width_full()
                     .padding_left(8.0)
@@ -690,6 +698,7 @@ fn message_view(
 fn text_view(
     text: RwSignal<String>,
     role: ChatRole,
+    opener: LinkOpener,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let id = AtomicU64::new(0);
@@ -699,7 +708,8 @@ fn text_view(
             text.with(|text| match role {
                 ChatRole::Error => {
                     let color = config.color(LapceColor::LAPCE_ERROR);
-                    vec![MarkdownContent::Text(plain_text(text, color, &config))]
+                    let layout = plain_text(text, color, &config);
+                    vec![MarkdownContent::Text(layout, Vec::new())]
                 }
                 _ => parse_markdown(text, CHAT_LINE_HEIGHT, &config),
             })
@@ -709,8 +719,8 @@ fn text_view(
             // A bubble shrinks to short prompts, so only cap the width there.
             // Replies stop near 80 characters so long lines stay readable.
             // List items sit tight, other blocks get a little room.
-            MarkdownContent::Text(text_layout) => {
-                rich_text(move || text_layout.clone())
+            MarkdownContent::Text(layout, links) => {
+                container(link_text(layout, links, opener.clone()))
                     .style(move |s| text_width(s, role, config).margin_vert(4.0))
                     .into_any()
             }
@@ -718,9 +728,13 @@ fn text_view(
                 marker,
                 depth,
                 layout,
-            } => container(list_item_view(marker, depth, layout))
-                .style(move |s| text_width(s, role, config))
-                .into_any(),
+                links,
+            } => {
+                let text = link_text(layout, links, opener.clone());
+                container(list_item_view(marker, depth, text))
+                    .style(move |s| text_width(s, role, config))
+                    .into_any()
+            }
             MarkdownContent::CodeBlock {
                 layout,
                 language,
@@ -746,6 +760,143 @@ fn text_view(
         },
     )
     .style(|s| s.flex_col().max_width_full())
+}
+
+/// Opens links in messages: web pages in the browser, workspace files in
+/// the editor
+#[derive(Clone)]
+struct LinkOpener {
+    workspace: Option<PathBuf>,
+    internal_command: Listener<InternalCommand>,
+}
+
+enum LinkTarget {
+    Url(String),
+    /// Line counted from 1
+    File(PathBuf, Option<usize>),
+}
+
+impl LinkOpener {
+    /// None for inline code that names no existing file
+    fn target(&self, target: &str) -> Option<LinkTarget> {
+        if target.starts_with("http://") || target.starts_with("https://") {
+            return Some(LinkTarget::Url(target.to_string()));
+        }
+        let (path, line) = split_line(target);
+        let path = Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.workspace.as_ref()?.join(path)
+        };
+        path.is_file().then_some(LinkTarget::File(path, line))
+    }
+
+    fn open(&self, target: LinkTarget) {
+        match target {
+            LinkTarget::Url(url) => {
+                if let Err(err) = open::that(&url) {
+                    tracing::error!("Failed to open {url}: {err}");
+                }
+            }
+            LinkTarget::File(path, line) => {
+                // EditorPosition lines count from 0
+                let position =
+                    line.map(|line| EditorPosition::Line(line.saturating_sub(1)));
+                self.internal_command.send(InternalCommand::GoToLocation {
+                    location: EditorLocation {
+                        path,
+                        position,
+                        scroll_offset: None,
+                        ignore_unconfirmed: false,
+                        same_editor_tab: false,
+                    },
+                });
+            }
+        }
+    }
+}
+
+/// `path:line`, `path:line:column` or `path#L42` into the path and line
+fn split_line(target: &str) -> (&str, Option<usize>) {
+    let number = |s: &str| {
+        let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        s[..end].parse().ok()
+    };
+    if let Some((path, line)) = target.split_once("#L") {
+        return (path, number(line));
+    }
+    match target.split_once(':') {
+        Some((path, rest)) if number(rest).is_some() => (path, number(rest)),
+        _ => (target, None),
+    }
+}
+
+/// Rich text whose links open on click, with a hand cursor over them
+fn link_text(layout: TextLayout, links: Vec<Link>, opener: LinkOpener) -> impl View {
+    let over_link = create_rw_signal(false);
+    let (hover_layout, hover_links, hover_opener) =
+        (layout.clone(), links.clone(), opener.clone());
+    let (click_layout, click_links) = (layout.clone(), links);
+    rich_text(move || layout.clone())
+        .on_event_cont(EventListener::PointerMove, move |event| {
+            let Event::PointerMove(event) = event else {
+                return;
+            };
+            let over = link_at(&hover_layout, &hover_links, event.pos)
+                .is_some_and(|link| hover_opener.target(&link.target).is_some());
+            if over != over_link.get_untracked() {
+                over_link.set(over);
+            }
+        })
+        .on_event_cont(EventListener::PointerLeave, move |_| over_link.set(false))
+        .on_click_cont(move |event| {
+            if let Event::PointerUp(event) = event
+                && let Some(link) = link_at(&click_layout, &click_links, event.pos)
+                && let Some(target) = opener.target(&link.target)
+            {
+                opener.open(target);
+            }
+        })
+        .style(move |s| {
+            s.width_full()
+                .apply_if(over_link.get(), |s| s.cursor(CursorStyle::Pointer))
+        })
+}
+
+/// What to ask and how to point Claude at files, while the chat is empty
+fn empty_state(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let messages = chat.messages;
+    let workspace = chat.common.workspace.path.as_ref();
+    let title = match workspace.and_then(|path| path.file_name()) {
+        Some(name) => format!("Ask Claude about {}", name.to_string_lossy()),
+        None => "Ask Claude".to_string(),
+    };
+    stack((
+        label(move || title.clone()).style(move |s| {
+            s.font_bold()
+                .font_size(config.get().ui.font_size() as f32 * 1.25)
+        }),
+        label(|| {
+            "Type @ to mention a file or / for a command.\n\
+             Drop files here to mention them."
+                .to_string()
+        })
+        .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM))),
+        text_button(|| "Resume a session", move || chat.open_sessions(), config),
+    ))
+    .style(move |s| {
+        s.absolute()
+            .size_pct(100.0, 100.0)
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(8.0)
+            .apply_if(messages.with(|m| !m.is_empty()), |s| s.hide())
+    })
 }
 
 fn text_width(
@@ -964,4 +1115,18 @@ fn tool_actions(
         container(changes).style(move |s| s.apply_if(!edits_file, |s| s.hide())),
     ))
     .style(move |s| s.gap(4.0).margin_top(4.0).apply_if(!has_file, |s| s.hide()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_line;
+
+    #[test]
+    fn split_line_number() {
+        assert_eq!(split_line("src/a.rs"), ("src/a.rs", None));
+        assert_eq!(split_line("src/a.rs:42"), ("src/a.rs", Some(42)));
+        assert_eq!(split_line("src/a.rs:42:7"), ("src/a.rs", Some(42)));
+        assert_eq!(split_line("src/a.rs#L9"), ("src/a.rs", Some(9)));
+        assert_eq!(split_line("std::fs"), ("std::fs", None));
+    }
 }

@@ -971,11 +971,13 @@ pub fn plugin_info_view(plugin: PluginData, volt: VoltID) -> impl View {
                                     )
                                 },
                                 move |content| match content {
-                                    MarkdownContent::Text(text_layout) => container(
-                                        rich_text(move || text_layout.clone())
-                                            .style(|s| s.width_full()),
-                                    )
-                                    .style(|s| s.width_full()),
+                                    MarkdownContent::Text(text_layout, _) => {
+                                        container(
+                                            rich_text(move || text_layout.clone())
+                                                .style(|s| s.width_full()),
+                                        )
+                                        .style(|s| s.width_full())
+                                    }
                                     MarkdownContent::CodeBlock {
                                         layout,
                                         ..
@@ -988,8 +990,12 @@ pub fn plugin_info_view(plugin: PluginData, volt: VoltID) -> impl View {
                                         marker,
                                         depth,
                                         layout,
+                                        ..
                                     } => container(list_item_view(
-                                        marker, depth, layout,
+                                        marker,
+                                        depth,
+                                        rich_text(move || layout.clone())
+                                            .style(|s| s.width_full()),
                                     ))
                                     .style(|s| s.width_full()),
                                     MarkdownContent::Table(rows) => {
