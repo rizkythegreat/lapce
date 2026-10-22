@@ -56,6 +56,8 @@ pub struct ChatMessage {
     pub tool: Option<ToolCall>,
     /// Only meaningful for tool messages
     pub status: RwSignal<ToolStatus>,
+    /// One line about a tool's output, e.g. "Read 256 lines"
+    pub result: RwSignal<Option<String>>,
     /// First message of a user or Claude turn, gets the turn label
     pub first_in_turn: bool,
 }
@@ -759,12 +761,8 @@ impl ClaudeChatData {
                     if block["type"] == "tool_result"
                         && let Some(id) = block["tool_use_id"].as_str()
                     {
-                        let status = if block["is_error"] == true {
-                            ToolStatus::Failed
-                        } else {
-                            ToolStatus::Done
-                        };
-                        self.set_tool_status(id, status);
+                        let output = result_text(&block["content"]);
+                        self.set_tool_result(id, &output, block["is_error"] == true);
                     }
                 }
             }
@@ -813,19 +811,25 @@ impl ClaudeChatData {
             text: self.scope.create_rw_signal(text),
             tool,
             status: self.scope.create_rw_signal(status),
+            result: self.scope.create_rw_signal(None),
             first_in_turn,
         };
         self.messages.update(|messages| messages.push_back(msg));
     }
 
-    fn set_tool_status(&self, tool_use_id: &str, status: ToolStatus) {
+    fn set_tool_result(&self, tool_use_id: &str, output: &str, failed: bool) {
         self.messages.with_untracked(|messages| {
             let msg = messages.iter().rev().find(|msg| {
                 msg.tool.as_ref().is_some_and(|tool| tool.id == tool_use_id)
             });
-            if let Some(msg) = msg {
-                msg.status.set(status);
-            }
+            let Some(msg) = msg else { return };
+            let Some(tool) = &msg.tool else { return };
+            msg.status.set(if failed {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Done
+            });
+            msg.result.set(result_summary(&tool.name, output, failed));
         });
     }
 
@@ -1166,6 +1170,37 @@ fn tool_call(block: &Value) -> ToolCall {
     }
 }
 
+/// Text of a `tool_result` content, a string or a list of text blocks
+fn result_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// "Read 256 lines" or the first line of a tool's output. None for a
+/// successful edit, its card already shows the change.
+fn result_summary(name: &str, output: &str, failed: bool) -> Option<String> {
+    let edits = matches!(name, "Edit" | "MultiEdit" | "Write" | "NotebookEdit");
+    if edits && !failed {
+        return None;
+    }
+    if name == "Read" && !failed {
+        return Some(format!("Read {} lines", output.lines().count()));
+    }
+    let mut lines = output.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first: String = lines.next()?.chars().take(120).collect();
+    Some(match lines.count() {
+        0 => first,
+        more => format!("{first} … +{more} lines"),
+    })
+}
+
 /// One line describing a tool call, e.g. "Bash: cargo test"
 fn tool_summary(block: &Value) -> String {
     let name = block["name"].as_str().unwrap_or("Tool");
@@ -1191,8 +1226,21 @@ mod tests {
         ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
         mention_query, parse_commands, parse_permission, parse_suggestion,
         parse_usage, path_mention, permission_response, project_dir_name,
-        read_history, replace_last_token, session_title, tool_call, tool_summary,
+        read_history, replace_last_token, result_summary, result_text,
+        session_title, tool_call, tool_summary,
     };
+
+    #[test]
+    fn result_summary_per_tool() {
+        let content = json!([{"type": "text", "text": "a\n\nb\nc"}]);
+        let output = result_text(&content);
+        let summary = |name| result_summary(name, &output, false).unwrap();
+        assert_eq!(summary("Read"), "Read 4 lines");
+        assert_eq!(summary("Bash"), "a … +2 lines");
+        assert_eq!(result_summary("Edit", "ok", false), None);
+        assert_eq!(result_summary("Edit", "no match", true).unwrap(), "no match");
+        assert_eq!(result_summary("Bash", "", false), None);
+    }
 
     #[test]
     fn tool_summary_picks_main_input() {

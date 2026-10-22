@@ -749,7 +749,7 @@ fn message_view(
         ChatRole::Assistant => {
             let text = msg.text;
             bulleted(
-                LapceColor::EDITOR_DIM,
+                || LapceColor::EDITOR_DIM,
                 stack((
                     text_view(text, role, opener, config),
                     copy_button(move || text.get_untracked(), config),
@@ -763,7 +763,7 @@ fn message_view(
             tool_card(msg, workspace, internal_command, config).into_any()
         }
         ChatRole::Error => bulleted(
-            LapceColor::LAPCE_ERROR,
+            || LapceColor::LAPCE_ERROR,
             text_view(msg.text, role, opener, config),
             config,
         )
@@ -777,7 +777,7 @@ fn message_view(
 /// A small dot in a gutter on the left, lined up with the first line of
 /// `body`, the rest of the block hangs after it
 fn bulleted(
-    color: &'static str,
+    color: impl Fn() -> &'static str + 'static,
     body: impl View + 'static,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
@@ -793,7 +793,7 @@ fn bulleted(
                 .margin_top(4.0 + (line - DOT) / 2.0)
                 .margin_right(GUTTER - DOT)
                 .border_radius(DOT / 2.0)
-                .background(config.color(color))
+                .background(config.color(color()))
         }),
         container(body)
             .style(|s| s.flex_grow(1.0f32).flex_basis(0.0).min_width(0.0)),
@@ -1070,18 +1070,8 @@ fn copy_button(
     .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
 }
 
-fn tool_icon(name: &str) -> &'static str {
-    match name {
-        "Bash" => LapceIcons::TERMINAL,
-        "Grep" | "Glob" => LapceIcons::SEARCH,
-        "WebFetch" | "WebSearch" => LapceIcons::LINK,
-        "Read" | "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => LapceIcons::FILE,
-        _ => LapceIcons::SETTINGS,
-    }
-}
-
-/// One line per tool call: icon, name, target and status. Clicking opens the
-/// diff preview and the file buttons.
+/// A tool call as "● Name target", then "└ result" and the change of an
+/// edit. The dot shows the status. Clicking a file call shows its buttons.
 fn tool_card(
     msg: ChatMessage,
     workspace: Option<PathBuf>,
@@ -1090,8 +1080,8 @@ fn tool_card(
 ) -> impl View {
     let tool = msg.tool.clone();
     let status = msg.status;
+    let result = msg.result;
     let name = tool.as_ref().map(|t| t.name.clone()).unwrap_or_default();
-    let icon = tool_icon(&name);
     let summary = msg.text.get_untracked();
     let detail = match tool.as_ref().and_then(|t| t.file.as_deref()) {
         Some(file) => display_path(file, workspace.as_deref()),
@@ -1106,35 +1096,16 @@ fn tool_card(
     let expanded = create_rw_signal(false);
 
     let dim = move |s: Style| s.color(config.get().color(LapceColor::EDITOR_DIM));
+    // "Read src/main.rs", the argument in the editor font
     let row = stack((
-        svg(move || config.get().ui_svg(icon)).style(move |s| {
-            let config = config.get();
-            let size = config.ui.icon_size() as f32;
-            s.size(size, size)
-                .min_width(size)
-                .color(config.color(LapceColor::EDITOR_DIM))
-        }),
         label(move || name.clone()).style(|s| s.font_bold()),
         label(move || detail.clone()).style(move |s| {
             dim(s)
+                .font_family(config.get().editor.font_family.clone())
                 .text_ellipsis()
                 .flex_grow(1.0f32)
                 .flex_basis(0.0)
                 .min_width(0.0)
-        }),
-        label(move || match status.get() {
-            ToolStatus::Running => "…",
-            ToolStatus::Done => "✓",
-            ToolStatus::Failed => "✗",
-        })
-        .style(move |s| {
-            let config = config.get();
-            let color = match status.get() {
-                ToolStatus::Running => LapceColor::EDITOR_DIM,
-                ToolStatus::Done => LapceColor::SOURCE_CONTROL_ADDED,
-                ToolStatus::Failed => LapceColor::LAPCE_ERROR,
-            };
-            s.color(config.color(color))
         }),
         label(move || if expanded.get() { "▾" } else { "▸" })
             .style(move |s| dim(s).apply_if(!expandable, |s| s.hide())),
@@ -1148,33 +1119,61 @@ fn tool_card(
         s.width_full()
             .items_center()
             .gap(6.0)
+            .margin_vert(4.0)
             .apply_if(expandable, |s| s.cursor(CursorStyle::Pointer))
             .selectable(false)
     });
 
-    let details = stack((
+    // "└ Read 256 lines" under the call once it finishes
+    let result_line = label(move || {
+        format!("└ {}", result.get().unwrap_or_default())
+    })
+    .style(move |s| {
+        let config = config.get();
+        let color = if status.get() == ToolStatus::Failed {
+            LapceColor::LAPCE_ERROR
+        } else {
+            LapceColor::EDITOR_DIM
+        };
+        s.color(config.color(color))
+            .padding_left(4.0)
+            .text_ellipsis()
+            .min_width(0.0)
+            .apply_if(result.with(|r| r.is_none()), |s| s.hide())
+    });
+
+    // The change in a short box, scrolls when longer
+    let diff_box = scroll(
         rich_text(move || {
             diff_layout(diff.as_deref().unwrap_or_default(), &config.get())
         })
-        .style(move |s| {
-            s.width_full().margin_top(4.0).apply_if(!has_diff, |s| s.hide())
-        }),
-        tool_actions(tool, internal_command, config),
-    ))
+        .style(|s| s.padding_horiz(8.0).padding_vert(4.0)),
+    )
     .style(move |s| {
-        s.flex_col().width_full().apply_if(!expanded.get(), |s| s.hide())
+        let config = config.get();
+        s.width_full()
+            .max_height(160.0)
+            .margin_vert(4.0)
+            .border(1.0)
+            .border_radius(4.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::EDITOR_BACKGROUND))
+            .apply_if(!has_diff, |s| s.hide())
     });
 
-    stack((row, details)).style(move |s| {
-        let config = config.get();
-        s.flex_col()
-            .width_full()
-            .padding_horiz(8.0)
-            .padding_vert(4.0)
-            .border(1.0)
-            .border_radius(6.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
-    })
+    let actions = container(tool_actions(tool, internal_command, config))
+        .style(move |s| s.apply_if(!expanded.get(), |s| s.hide()));
+
+    bulleted(
+        move || match status.get() {
+            ToolStatus::Running => LapceColor::EDITOR_DIM,
+            ToolStatus::Done => LapceColor::SOURCE_CONTROL_ADDED,
+            ToolStatus::Failed => LapceColor::LAPCE_ERROR,
+        },
+        stack((row, result_line, diff_box, actions))
+            .style(|s| s.flex_col().width_full()),
+        config,
+    )
 }
 
 /// Workspace-relative path when the file is inside the workspace
