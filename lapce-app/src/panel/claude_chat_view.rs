@@ -42,6 +42,8 @@ pub fn claude_chat_panel(
     let show_sessions = chat.show_sessions;
     let is_focused = move || focus.get() == Focus::Panel(PanelKind::ClaudeChat);
     let content_height = create_rw_signal(0.0);
+    // Scroll content is unbounded, give it the visible width so text wraps
+    let scroll_width = create_rw_signal(0.0);
 
     {
         let chat = chat.clone();
@@ -66,12 +68,19 @@ pub fn claude_chat_panel(
                     move |msg| message_view(msg, config),
                 )
                 .on_resize(move |rect| content_height.set(rect.height()))
-                .style(|s| s.flex_col().width_full().padding(10.0).gap(10.0)),
+                .style(move |s| {
+                    s.flex_col().width(scroll_width.get()).padding(10.0).gap(10.0)
+                }),
             )
             // Follow the conversation as it grows
             .ensure_visible(move || {
                 let height = content_height.get();
                 Rect::new(0.0, height - 1.0, 1.0, height)
+            })
+            .on_resize(move |rect| {
+                if scroll_width.get_untracked() != rect.width() {
+                    scroll_width.set(rect.width());
+                }
             })
             .style(|s| s.absolute().size_pct(100.0, 100.0)),
         )
@@ -261,6 +270,7 @@ fn sessions_view(
 ) -> impl View {
     let sessions = chat.sessions;
     let show_sessions = chat.show_sessions;
+    let scroll_width = create_rw_signal(0.0);
     stack((
         label(|| "No sessions for this workspace".to_string()).style(move |s| {
             s.padding(10.0)
@@ -273,8 +283,13 @@ fn sessions_view(
                 |session| session.id.clone(),
                 move |session| session_row(session, chat.clone(), config),
             )
-            .style(|s| s.flex_col().width_full()),
+            .style(move |s| s.flex_col().width(scroll_width.get())),
         )
+        .on_resize(move |rect| {
+            if scroll_width.get_untracked() != rect.width() {
+                scroll_width.set(rect.width());
+            }
+        })
         .style(|s| s.absolute().size_pct(100.0, 100.0)),
     ))
     .style(move |s| {
@@ -354,8 +369,11 @@ fn message_view(
         move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         move |content| match content {
             MarkdownContent::Text(text_layout) => {
-                container(rich_text(move || text_layout.clone()))
-                    .style(|s| s.width_full())
+                container(
+                    rich_text(move || text_layout.clone())
+                        .style(|s| s.width_full()),
+                )
+                .style(|s| s.width_full())
                     .into_any()
             }
             MarkdownContent::Image { .. } => empty().into_any(),
