@@ -364,12 +364,17 @@ fn animate(
     });
 }
 
+/// Tighter than the 1.8 of hover popups, for long replies
+const CHAT_LINE_HEIGHT: f64 = 1.5;
+/// About 80 characters of the UI font
+const REPLY_MAX_EMS: f64 = 44.0;
+
 /// Wrapping plain text in the UI font
 fn plain_text(text: &str, color: Color, config: &LapceConfig) -> TextLayout {
     let attrs = Attrs::new()
         .color(color)
         .font_size(config.ui.font_size() as f32)
-        .line_height(LineHeightValue::Normal(1.8));
+        .line_height(LineHeightValue::Normal(CHAT_LINE_HEIGHT as f32));
     let mut layout = TextLayout::new();
     layout.set_text(text, AttrsList::new(attrs), None);
     layout
@@ -687,17 +692,22 @@ fn text_view(
                     let color = config.color(LapceColor::LAPCE_ERROR);
                     vec![MarkdownContent::Text(plain_text(text, color, &config))]
                 }
-                _ => parse_markdown(text, 1.8, &config),
+                _ => parse_markdown(text, CHAT_LINE_HEIGHT, &config),
             })
         },
         move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         move |content| match content {
-            // A bubble shrinks to short prompts, so only cap the width there
+            // A bubble shrinks to short prompts, so only cap the width there.
+            // Replies stop near 80 characters so long lines stay readable.
             MarkdownContent::Text(text_layout) => {
                 rich_text(move || text_layout.clone())
                     .style(move |s| {
+                        let max_width =
+                            config.get().ui.font_size() as f64 * REPLY_MAX_EMS;
                         s.apply_if(role == ChatRole::User, |s| s.max_width_full())
-                            .apply_if(role != ChatRole::User, |s| s.width_full())
+                            .apply_if(role != ChatRole::User, |s| {
+                                s.width_full().max_width(max_width)
+                            })
                     })
                     .into_any()
             }
