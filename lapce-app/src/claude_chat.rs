@@ -140,6 +140,26 @@ pub struct SessionInfo {
     pub modified: SystemTime,
 }
 
+/// How full the context is and what the session cost, from the stream
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ContextUsage {
+    /// Prompt and reply tokens of the last request, what the next one builds on
+    pub tokens: u64,
+    /// Context window of that request's model, None until a turn ends
+    pub window: Option<u64>,
+    /// Claude Code's estimate at API prices, None until a turn ends
+    pub cost: Option<f64>,
+    /// Model of the last request, keys the window in the turn's result
+    model: String,
+}
+
+impl ContextUsage {
+    pub fn percent(&self) -> Option<f64> {
+        let window = self.window.filter(|w| *w > 0)?;
+        Some(self.tokens as f64 * 100.0 / window as f64)
+    }
+}
+
 /// Plan usage of each window, from Claude Code's `get_usage`
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UsageLimits {
@@ -223,6 +243,8 @@ pub struct ClaudeChatData {
     pub permissions: RwSignal<im::Vector<PermissionRequest>>,
     /// Refreshed on spawn and after every turn, None until first answered
     pub usage: RwSignal<Option<UsageLimits>>,
+    /// None until the session's first reply
+    pub context: RwSignal<Option<ContextUsage>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -306,6 +328,7 @@ impl ClaudeChatData {
             effort: cx.create_rw_signal(None),
             permissions: cx.create_rw_signal(im::Vector::new()),
             usage: cx.create_rw_signal(None),
+            context: cx.create_rw_signal(None),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -660,6 +683,7 @@ impl ClaudeChatData {
 
     pub fn new_session(&self) {
         self.stop();
+        self.context.set(None);
         self.session_id.set(None);
         self.messages.set(im::Vector::new());
         self.show_sessions.set(false);
@@ -678,6 +702,7 @@ impl ClaudeChatData {
 
     pub fn resume(&self, id: String) {
         self.stop();
+        self.context.set(None);
         self.session_id.set(Some(id.clone()));
         self.messages.set(im::Vector::new());
         self.show_sessions.set(false);
@@ -892,6 +917,16 @@ impl ClaudeChatData {
                 }
             }
             Some("assistant") => {
+                // Subagent requests have their own context
+                let usage = &event["message"]["usage"];
+                if event["parent_tool_use_id"].is_null() && usage.is_object() {
+                    let model = event["message"]["model"].as_str();
+                    self.context.update(|context| {
+                        let context = context.get_or_insert_default();
+                        context.tokens = request_tokens(usage);
+                        context.model = model.unwrap_or_default().to_string();
+                    });
+                }
                 let blocks = event["message"]["content"].as_array();
                 for block in blocks.into_iter().flatten() {
                     if block["type"] == "tool_use" {
@@ -918,6 +953,15 @@ impl ClaudeChatData {
             Some("result") => {
                 self.busy.set(false);
                 self.request_usage();
+                self.context.update(|context| {
+                    if let Some(context) = context {
+                        let usage = &event["modelUsage"];
+                        let window = usage[&context.model]["contextWindow"].as_u64();
+                        context.window = window.or(context.window);
+                        let cost = event["total_cost_usd"].as_f64();
+                        context.cost = cost.or(context.cost);
+                    }
+                });
                 if event["is_error"] == true {
                     let text = event["result"].as_str().unwrap_or("Request failed");
                     self.push(ChatRole::Error, text.to_string());
@@ -1338,6 +1382,20 @@ fn tool_call(block: &Value) -> ToolCall {
     }
 }
 
+/// Tokens one request put in the context: its prompt, cached or not, and
+/// its reply
+fn request_tokens(usage: &Value) -> u64 {
+    [
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ]
+    .iter()
+    .filter_map(|key| usage[key].as_u64())
+    .sum()
+}
+
 /// Text of a `tool_result` content, a string or a list of text blocks
 fn result_text(content: &Value) -> String {
     match content {
@@ -1394,9 +1452,21 @@ mod tests {
         ChatRole, PermissionDecision, SlashCommand, filter_commands, filter_files,
         mention_query, parse_commands, parse_permission, parse_suggestion,
         parse_usage, path_mention, permission_response, project_dir_name,
-        parse_models, read_history, replace_last_token, result_summary,
-        result_text, session_title, tool_call, tool_summary,
+        parse_models, read_history, replace_last_token, request_tokens,
+        result_summary, result_text, session_title, tool_call, tool_summary,
     };
+
+    #[test]
+    fn request_tokens_counts_cache() {
+        let usage = json!({
+            "input_tokens": 10,
+            "cache_creation_input_tokens": 10601,
+            "cache_read_input_tokens": 12231,
+            "output_tokens": 6,
+        });
+        assert_eq!(request_tokens(&usage), 22848);
+        assert_eq!(request_tokens(&json!(null)), 0);
+    }
 
     #[test]
     fn models_from_initialize() {

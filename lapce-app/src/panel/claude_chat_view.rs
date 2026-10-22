@@ -28,11 +28,11 @@ use floem::{
 
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
-    app::clickable_icon,
+    app::{clickable_icon, tooltip_label},
     claude_chat::{
-        ChatMessage, ChatRole, ClaudeChatData, PERMISSION_MODES, PermissionRequest,
-        PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits, UsageWindow,
-        mention_query,
+        ChatMessage, ChatRole, ClaudeChatData, ContextUsage, PERMISSION_MODES,
+        PermissionRequest, PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits,
+        UsageWindow, mention_query,
     },
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
@@ -366,6 +366,7 @@ fn input_toolbar(
         }),
         model_button(chat.clone(), config),
         effort_button(chat.clone(), config),
+        context_view(chat.context, config),
         empty().style(|s| s.flex_grow(1.0f32)),
         container(text_button(
             || "/",
@@ -420,6 +421,61 @@ fn send_button(
             .background(config.color(LapceColor::LAPCE_BUTTON_PRIMARY_BACKGROUND))
             .hover(|s| s.cursor(CursorStyle::Pointer))
     })
+}
+
+/// "21% context", amber from 80% and red from 95% so a `/compact` or new
+/// chat comes in time. Hover shows the tokens and Claude Code's cost estimate.
+fn context_view(
+    context: RwSignal<Option<ContextUsage>>,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let text = label(move || {
+        let Some(context) = context.get() else {
+            return String::new();
+        };
+        match context.percent() {
+            Some(percent) => format!("{percent:.0}% context"),
+            None => format!("{} tokens", compact_count(context.tokens)),
+        }
+    })
+    .style(move |s| {
+        let config = config.get();
+        let percent = context.with(|c| c.as_ref().and_then(|c| c.percent()));
+        let color = match percent {
+            Some(p) if p >= 95.0 => LapceColor::LAPCE_ERROR,
+            Some(p) if p >= 80.0 => LapceColor::LAPCE_WARN,
+            _ => LapceColor::EDITOR_DIM,
+        };
+        s.padding_horiz(8.0)
+            .color(config.color(color))
+            .selectable(false)
+    });
+    container(tooltip_label(config, text, move || {
+        let Some(context) = context.get_untracked() else {
+            return String::new();
+        };
+        let window = context
+            .window
+            .map(|w| format!(" / {}", compact_count(w)))
+            .unwrap_or_default();
+        let cost = context
+            .cost
+            .map(|c| format!(" · ${c:.2} at API prices"))
+            .unwrap_or_default();
+        format!("{} tokens{window}{cost}", compact_count(context.tokens))
+    }))
+    .style(move |s| s.apply_if(context.with(|c| c.is_none()), |s| s.hide()))
+}
+
+/// 42600 as "42.6k", 1000000 as "1M"
+fn compact_count(n: u64) -> String {
+    let (value, unit) = match n {
+        1_000_000.. => (n as f64 / 1_000_000.0, "M"),
+        1_000.. => (n as f64 / 1_000.0, "k"),
+        _ => return n.to_string(),
+    };
+    let text = format!("{value:.1}");
+    format!("{}{unit}", text.trim_end_matches(".0"))
 }
 
 /// "Model: Sonnet 5", the menu lists what Claude Code offers this account
@@ -1407,7 +1463,15 @@ fn tool_actions(
 
 #[cfg(test)]
 mod tests {
-    use super::split_line;
+    use super::{compact_count, split_line};
+
+    #[test]
+    fn compact_counts() {
+        assert_eq!(compact_count(950), "950");
+        assert_eq!(compact_count(42_600), "42.6k");
+        assert_eq!(compact_count(200_000), "200k");
+        assert_eq!(compact_count(1_000_000), "1M");
+    }
 
     #[test]
     fn split_line_number() {
