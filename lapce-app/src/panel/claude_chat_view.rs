@@ -177,7 +177,16 @@ fn header(
 ) -> impl View {
     let show_sessions = chat.show_sessions;
     let usage = chat.usage;
+    let messages = chat.messages;
     let chat2 = chat.clone();
+    // The first prompt names the conversation, like the session list does
+    let title = create_memo(move |_| {
+        messages.with(|messages| {
+            let prompt = messages.iter().find(|m| m.role == ChatRole::User)?;
+            let text = prompt.text.get();
+            Some(text.lines().next().unwrap_or_default().trim().to_string())
+        })
+    });
     let maximized = {
         let panel = panel.clone();
         move || {
@@ -189,20 +198,57 @@ fn header(
     };
     let maximized2 = maximized.clone();
     stack((
-        text_button(|| "New chat", move || chat.new_session(), config),
-        text_button(
-            move || if show_sessions.get() { "Back" } else { "Sessions" },
-            move || {
-                if show_sessions.get_untracked() {
-                    show_sessions.set(false);
+        // Title and chevron open the past sessions, click again to go back
+        stack((
+            label(move || {
+                if show_sessions.get() {
+                    "Past conversations".to_string()
                 } else {
-                    chat2.open_sessions();
+                    title.get().unwrap_or_else(|| "New chat".to_string())
                 }
-            },
-            config,
-        ),
+            })
+            .style(|s| s.font_bold().text_ellipsis().min_width(0.0)),
+            svg(move || config.get().ui_svg(LapceIcons::DROPDOWN_ARROW)).style(
+                move |s| {
+                    let config = config.get();
+                    let size = config.ui.icon_size() as f32;
+                    s.size(size, size)
+                        .min_width(size)
+                        .color(config.color(LapceColor::LAPCE_ICON_ACTIVE))
+                },
+            ),
+        ))
+        .on_click_stop(move |_| {
+            if show_sessions.get_untracked() {
+                show_sessions.set(false);
+            } else {
+                chat2.open_sessions();
+            }
+        })
+        .style(move |s| {
+            s.items_center()
+                .gap(4.0)
+                .min_width(0.0)
+                .flex_shrink(1.0f32)
+                .padding_horiz(6.0)
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .hover(|s| {
+                    s.background(
+                        config.get().color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                    )
+                })
+        }),
         empty().style(|s| s.flex_grow(1.0f32)),
         usage_view(usage, config),
+        clickable_icon(
+            || LapceIcons::ADD,
+            move || chat.new_session(),
+            || false,
+            || false,
+            || "New chat",
+            config,
+        ),
         clickable_icon(
             move || {
                 if maximized() {
