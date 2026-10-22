@@ -35,6 +35,7 @@ use crate::{
     doc::relative_time,
     listener::Listener,
     markdown::{MarkdownContent, parse_markdown},
+    panel::data::PanelData,
     text_input::TextInputBuilder,
     window_tab::{Focus, WindowTabData},
 };
@@ -78,7 +79,7 @@ pub fn claude_chat_panel(
     }
 
     stack((
-        header(chat.clone(), config),
+        header(chat.clone(), window_tab_data.panel.clone(), config),
         sessions_view(chat.clone(), config),
         container(
             scroll(
@@ -172,10 +173,24 @@ pub fn claude_chat_panel(
     .debug_name("Claude Chat Panel")
 }
 
-fn header(chat: ClaudeChatData, config: ReadSignal<Arc<LapceConfig>>) -> impl View {
+fn header(
+    chat: ClaudeChatData,
+    panel: PanelData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
     let show_sessions = chat.show_sessions;
     let skip = chat.skip_permissions;
     let chat2 = chat.clone();
+    let maximized = {
+        let panel = panel.clone();
+        move || {
+            let Some((_, p)) = panel.panel_position(&PanelKind::ClaudeChat) else {
+                return false;
+            };
+            panel.is_container_maximized(&p.container(), true)
+        }
+    };
+    let maximized2 = maximized.clone();
     stack((
         text_button(|| "New chat", move || chat.new_session(), config),
         // Applies from the next message, the process restarts on the same session
@@ -205,9 +220,25 @@ fn header(chat: ClaudeChatData, config: ReadSignal<Arc<LapceConfig>>) -> impl Vi
             },
             config,
         ),
+        empty().style(|s| s.flex_grow(1.0f32)),
+        clickable_icon(
+            move || {
+                if maximized() {
+                    LapceIcons::PANEL_RESTORE
+                } else {
+                    LapceIcons::PANEL_MAXIMISE
+                }
+            },
+            move || panel.toggle_maximize(&PanelKind::ClaudeChat),
+            || false,
+            || false,
+            move || if maximized2() { "Restore" } else { "Maximize" },
+            config,
+        ),
     ))
     .style(move |s| {
         s.width_full()
+            .items_center()
             .padding(4.0)
             .gap(4.0)
             .border_bottom(1.0)

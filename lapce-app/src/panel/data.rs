@@ -320,47 +320,61 @@ impl PanelData {
         let focus = self.common.focus.get_untracked();
         if let Focus::Panel(kind) = focus {
             if let Some((_, pos)) = self.panel_position(&kind) {
-                if pos.is_bottom() {
-                    self.toggle_bottom_maximize();
-                }
+                self.toggle_container_maximize(&pos.container());
             }
         }
     }
 
     pub fn toggle_maximize(&self, kind: &PanelKind) {
         if let Some((_, p)) = self.panel_position(kind) {
-            if p.is_bottom() {
-                self.toggle_bottom_maximize();
-            }
+            self.toggle_container_maximize(&p.container());
         }
     }
 
     pub fn toggle_bottom_maximize(&self) {
-        let maximized = !self.panel_bottom_maximized(false);
+        self.toggle_container_maximize(&PanelContainerPosition::Bottom);
+    }
+
+    /// The bottom container takes the editor's space, a side container takes
+    /// the whole workbench. Only one container is maximized at a time.
+    pub fn toggle_container_maximize(&self, container: &PanelContainerPosition) {
+        let maximized = !self.is_container_maximized(container, false);
         self.styles.update(|styles| {
-            if let Some(style) = styles.get_mut(&PanelPosition::BottomLeft) {
-                style.maximized = maximized;
-            }
-            if let Some(style) = styles.get_mut(&PanelPosition::BottomRight) {
-                style.maximized = maximized;
+            for (position, style) in styles.iter_mut() {
+                style.maximized = maximized && position.container() == *container;
             }
         });
     }
 
-    pub fn panel_bottom_maximized(&self, tracked: bool) -> bool {
-        let styles = if tracked {
-            self.styles.get()
-        } else {
-            self.styles.get_untracked()
+    pub fn is_container_maximized(
+        &self,
+        container: &PanelContainerPosition,
+        tracked: bool,
+    ) -> bool {
+        let maximized = |styles: &im::HashMap<PanelPosition, PanelStyle>| {
+            [container.first(), container.second()]
+                .iter()
+                .any(|p| styles.get(p).is_some_and(|s| s.maximized))
         };
-        styles
-            .get(&PanelPosition::BottomLeft)
-            .map(|p| p.maximized)
-            .unwrap_or(false)
-            || styles
-                .get(&PanelPosition::BottomRight)
-                .map(|p| p.maximized)
-                .unwrap_or(false)
+        if tracked {
+            self.styles.with(maximized)
+        } else {
+            self.styles.with_untracked(maximized)
+        }
+    }
+
+    pub fn panel_bottom_maximized(&self, tracked: bool) -> bool {
+        self.is_container_maximized(&PanelContainerPosition::Bottom, tracked)
+    }
+
+    /// The visible left or right container filling the workbench, if any
+    pub fn maximized_side(&self, tracked: bool) -> Option<PanelContainerPosition> {
+        [PanelContainerPosition::Left, PanelContainerPosition::Right]
+            .into_iter()
+            .find(|side| {
+                self.is_container_maximized(side, tracked)
+                    && self.is_container_shown(side, tracked)
+            })
     }
 
     pub fn toggle_container_visual(&self, position: &PanelContainerPosition) {

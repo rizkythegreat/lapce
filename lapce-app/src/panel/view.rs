@@ -423,8 +423,17 @@ pub fn panel_container_view(
             PanelContainerPosition::Right => s.right,
         });
         let is_maximized = panel.panel_bottom_maximized(true);
+        let maximized_side = panel.maximized_side(true);
+        // A maximized side container grows over the space of the others
+        let side_width = |s: Style| match maximized_side {
+            Some(side) if side == position => s.flex_grow(1.0f32),
+            _ => s.width(size as f32),
+        };
         let config = config.get();
         s.apply_if(!panel.is_container_shown(&position, true), |s| s.hide())
+            .apply_if(maximized_side.is_some_and(|side| side != position), |s| {
+                s.hide()
+            })
             .apply_if(position == PanelContainerPosition::Bottom, |s| {
                 s.width_pct(100.0)
                     .apply_if(!is_maximized, |s| {
@@ -433,14 +442,14 @@ pub fn panel_container_view(
                     .apply_if(is_maximized, |s| s.flex_grow(1.0f32))
             })
             .apply_if(position == PanelContainerPosition::Left, |s| {
-                s.border_right(1.0)
-                    .width(size as f32)
+                side_width(s)
+                    .border_right(1.0)
                     .height_pct(100.0)
                     .background(config.color(LapceColor::PANEL_BACKGROUND))
             })
             .apply_if(position == PanelContainerPosition::Right, |s| {
-                s.border_left(1.0)
-                    .width(size as f32)
+                side_width(s)
+                    .border_left(1.0)
                     .height_pct(100.0)
                     .background(config.color(LapceColor::PANEL_BACKGROUND))
             })
@@ -546,6 +555,7 @@ fn panel_picker(
     let dragging = window_tab_data.common.dragging;
     let is_bottom = position.is_bottom();
     let is_first = position.is_first();
+    let panel2 = panel.clone();
     dyn_stack(
         move || {
             panel
@@ -643,6 +653,11 @@ fn panel_picker(
             .style(|s| s.padding(6.0))
         },
     )
+    // Same as the terminal header: double click maximizes the container
+    .on_double_click(move |_| {
+        panel2.toggle_container_maximize(&position.container());
+        EventPropagation::Stop
+    })
     .style(move |s| {
         s.border_color(config.get().color(LapceColor::LAPCE_BORDER))
             .apply_if(

@@ -32,6 +32,16 @@ impl PanelPosition {
         )
     }
 
+    pub fn container(&self) -> PanelContainerPosition {
+        if self.is_bottom() {
+            PanelContainerPosition::Bottom
+        } else if self.is_left() {
+            PanelContainerPosition::Left
+        } else {
+            PanelContainerPosition::Right
+        }
+    }
+
     pub fn peer(&self) -> PanelPosition {
         match &self {
             PanelPosition::LeftTop => PanelPosition::LeftBottom,

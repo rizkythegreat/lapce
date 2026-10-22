@@ -2193,6 +2193,7 @@ fn tooltip_tip<V: View + 'static>(
 fn workbench(window_tab_data: Rc<WindowTabData>) -> impl View {
     let workbench_size = window_tab_data.common.workbench_size;
     let main_split_width = window_tab_data.main_split.width;
+    let panel = window_tab_data.panel.clone();
     stack((
         panel_container_view(window_tab_data.clone(), PanelContainerPosition::Left),
         {
@@ -2210,7 +2211,11 @@ fn workbench(window_tab_data: Rc<WindowTabData>) -> impl View {
                     main_split_width.set(width);
                 }
             })
-            .style(|s| s.flex_col().flex_grow(1.0f32))
+            .style(move |s| {
+                // Editor and bottom panel give way to a maximized side panel
+                let side_maximized = panel.maximized_side(true).is_some();
+                s.flex_col().flex_grow(1.0f32).apply_if(side_maximized, |s| s.hide())
+            })
         },
         panel_container_view(window_tab_data.clone(), PanelContainerPosition::Right),
         window_message_view(window_tab_data.messages, window_tab_data.common.config),
