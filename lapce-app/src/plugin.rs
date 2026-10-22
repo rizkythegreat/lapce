@@ -976,6 +976,14 @@ pub fn plugin_info_view(plugin: PluginData, volt: VoltID) -> impl View {
                                             .style(|s| s.width_full()),
                                     )
                                     .style(|s| s.width_full()),
+                                    MarkdownContent::CodeBlock {
+                                        layout,
+                                        ..
+                                    } => container(
+                                        rich_text(move || layout.clone())
+                                            .style(|s| s.width_full()),
+                                    )
+                                    .style(|s| s.width_full().padding_vert(4.0)),
                                     MarkdownContent::Image { .. } => {
                                         container(empty())
                                     }

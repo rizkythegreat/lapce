@@ -3085,6 +3085,10 @@ fn hover(window_tab_data: Rc<WindowTabData>) -> impl View {
                         .style(|s| s.max_width(600.0)),
                 )
                 .style(|s| s.max_width_full()),
+                MarkdownContent::CodeBlock { layout, .. } => container(
+                    rich_text(move || layout.clone()).style(|s| s.max_width(600.0)),
+                )
+                .style(|s| s.max_width_full().padding_vert(4.0)),
                 MarkdownContent::Image { .. } => container(empty()),
                 MarkdownContent::Separator => container(empty().style(move |s| {
                     s.width_full()

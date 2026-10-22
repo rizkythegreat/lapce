@@ -18,8 +18,9 @@ use floem::{
     style::{CursorStyle, Style},
     text::{Attrs, AttrsList, FamilyOwned, LineHeightValue, TextLayout},
     views::{
-        Decorators, container, dyn_stack, empty, label, rich_text, scroll, stack,
-        svg,
+        Decorators, container, dyn_stack,
+        editor::{core::register::Clipboard, text::SystemClipboard},
+        empty, label, rich_text, scroll, stack, svg,
     },
 };
 
@@ -647,7 +648,15 @@ fn message_view(
                     .background(bg)
             })
             .into_any(),
-        ChatRole::Assistant => text_view(msg.text, role, config).into_any(),
+        ChatRole::Assistant => {
+            let text = msg.text;
+            stack((
+                text_view(text, role, config),
+                copy_button(move || text.get_untracked(), config),
+            ))
+            .style(|s| s.flex_col().width_full().items_start().gap(2.0))
+            .into_any()
+        }
         ChatRole::Tool => {
             tool_card(msg, workspace, internal_command, config).into_any()
         }
@@ -711,6 +720,11 @@ fn text_view(
                     })
                     .into_any()
             }
+            MarkdownContent::CodeBlock {
+                layout,
+                language,
+                code,
+            } => code_block_view(layout, language, code, config).into_any(),
             MarkdownContent::Image { .. } => empty().into_any(),
             MarkdownContent::Separator => empty()
                 .style(move |s| {
@@ -722,7 +736,61 @@ fn text_view(
                 .into_any(),
         },
     )
-    .style(|s| s.flex_col().max_width_full())
+    .style(|s| s.flex_col().max_width_full().gap(8.0))
+}
+
+/// Code in a bordered box, its language and a copy button on top
+fn code_block_view(
+    layout: TextLayout,
+    language: String,
+    code: String,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    stack((
+        stack((
+            label(move || language.clone()),
+            empty().style(|s| s.flex_grow(1.0f32)),
+            copy_button(move || code.clone(), config),
+        ))
+        .style(move |s| {
+            let config = config.get();
+            s.width_full()
+                .items_center()
+                .padding_left(8.0)
+                .padding_vert(2.0)
+                .border_bottom(1.0)
+                .border_color(config.color(LapceColor::LAPCE_BORDER))
+                .color(config.color(LapceColor::EDITOR_DIM))
+        }),
+        rich_text(move || layout.clone()).style(|s| s.width_full().padding(8.0)),
+    ))
+    .style(move |s| {
+        let config = config.get();
+        s.flex_col()
+            .width_full()
+            .border(1.0)
+            .border_radius(6.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .background(config.color(LapceColor::EDITOR_BACKGROUND))
+    })
+}
+
+/// "Copy", briefly "Copied" after a click
+fn copy_button(
+    text: impl Fn() -> String + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let copied = create_rw_signal(false);
+    container(text_button(
+        move || if copied.get() { "Copied" } else { "Copy" },
+        move || {
+            SystemClipboard::new().put_string(text());
+            copied.set(true);
+            exec_after(Duration::from_millis(1500), move |_| copied.set(false));
+        },
+        config,
+    ))
+    .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
 }
 
 fn tool_icon(name: &str) -> &'static str {

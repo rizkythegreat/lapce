@@ -4,7 +4,7 @@ use floem::text::{
 use lapce_core::{language::LapceLanguage, syntax::Syntax};
 use lapce_xi_rope::Rope;
 use lsp_types::MarkedString;
-use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
 use smallvec::SmallVec;
 
 use crate::config::{LapceConfig, color::LapceColor};
@@ -12,6 +12,12 @@ use crate::config::{LapceConfig, color::LapceColor};
 #[derive(Clone)]
 pub enum MarkdownContent {
     Text(TextLayout),
+    /// Highlighted code, `language` is the fence info's first word
+    CodeBlock {
+        layout: TextLayout,
+        language: String,
+        code: String,
+    },
     Image { url: String, title: String },
     Separator,
 }
@@ -32,6 +38,10 @@ pub fn parse_markdown(
         .font_size(config.ui.font_size() as f32)
         .line_height(LineHeightValue::Normal(line_height as f32));
     let mut attr_list = AttrsList::new(default_attrs.clone());
+    // Attrs has no background, so inline code stands out by color instead
+    let inline_code_color = config
+        .style_color("string")
+        .unwrap_or_else(|| config.color(LapceColor::EDITOR_FOREGROUND));
 
     let mut builder_dirty = false;
 
@@ -47,7 +57,6 @@ pub fn parse_markdown(
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_HEADING_ATTRIBUTES,
     );
-    let mut last_text = CowStr::from("");
     // Line breaks owed to the next entry, 2 leaves a blank line between blocks.
     // Deferred so that we don't emit newlines at the very end of the generation
     let mut add_newlines = 0;
@@ -99,6 +108,49 @@ pub fn parse_markdown(
                         continue;
                     }
 
+                    // Code blocks become their own item, splitting the text
+                    if let Tag::CodeBlock(kind) = &tag {
+                        let code = current_text[start_offset..]
+                            .trim_end_matches('\n')
+                            .to_string();
+                        current_text.truncate(start_offset);
+                        flush_text(
+                            &mut res,
+                            &mut current_text,
+                            &mut attr_list,
+                            &default_attrs,
+                        );
+                        pos = 0;
+                        builder_dirty = false;
+                        add_newlines = 0;
+
+                        let language = match kind {
+                            CodeBlockKind::Fenced(info) => {
+                                info.split_whitespace().next().unwrap_or_default()
+                            }
+                            CodeBlockKind::Indented => "",
+                        };
+                        let code_attrs =
+                            default_attrs.clone().family(&code_font_family);
+                        let mut code_attr_list = AttrsList::new(code_attrs.clone());
+                        highlight_as_code(
+                            &mut code_attr_list,
+                            code_attrs,
+                            md_language_to_lapce_language(language),
+                            &code,
+                            0,
+                            config,
+                        );
+                        let mut layout = TextLayout::new();
+                        layout.set_text(&code, code_attr_list, None);
+                        res.push(MarkdownContent::CodeBlock {
+                            layout,
+                            language: language.to_string(),
+                            code,
+                        });
+                        continue;
+                    }
+
                     if let Some(attrs) = attribute_for_tag(
                         default_attrs.clone(),
                         &tag,
@@ -118,24 +170,6 @@ pub fn parse_markdown(
                         add_newlines.max(newlines_after_tag(&tag, in_item));
 
                     match &tag {
-                        Tag::CodeBlock(kind) => {
-                            let language =
-                                if let CodeBlockKind::Fenced(language) = kind {
-                                    md_language_to_lapce_language(language)
-                                } else {
-                                    None
-                                };
-
-                            highlight_as_code(
-                                &mut attr_list,
-                                default_attrs.clone().family(&code_font_family),
-                                language,
-                                &last_text,
-                                start_offset,
-                                config,
-                            );
-                            builder_dirty = true;
-                        }
                         Tag::Image {
                             link_type: _,
                             dest_url: dest,
@@ -177,13 +211,15 @@ pub fn parse_markdown(
                 }
                 current_text.push_str(&text);
                 pos += text.len();
-                last_text = text;
                 builder_dirty = true;
             }
             Event::Code(text) => {
                 attr_list.add_span(
                     pos..pos + text.len(),
-                    default_attrs.clone().family(&code_font_family),
+                    default_attrs
+                        .clone()
+                        .family(&code_font_family)
+                        .color(inline_code_color),
                 );
                 current_text.push_str(&text);
                 pos += text.len();
@@ -234,6 +270,23 @@ pub fn parse_markdown(
     }
 
     res
+}
+
+/// Push the pending text as its own item, without trailing line breaks
+fn flush_text(
+    res: &mut Vec<MarkdownContent>,
+    text: &mut String,
+    attr_list: &mut AttrsList,
+    default_attrs: &Attrs,
+) {
+    let attrs = std::mem::replace(attr_list, AttrsList::new(default_attrs.clone()));
+    let trimmed = text.trim_end_matches('\n');
+    if !trimmed.is_empty() {
+        let mut layout = TextLayout::new();
+        layout.set_text(trimmed, attrs, None);
+        res.push(MarkdownContent::Text(layout));
+    }
+    text.clear();
 }
 
 fn attribute_for_tag<'a>(
@@ -421,5 +474,19 @@ mod tests {
         assert_eq!(rendered("3. x\n4. y"), "3. x\n4. y");
         assert_eq!(rendered("- x\n  - y\n- z"), "• x\n    • y\n• z");
         assert_eq!(rendered("- [x] done"), "• [x] done");
+    }
+
+    #[test]
+    fn code_block_is_its_own_item() {
+        let config = LapceConfig::default_lapce_config();
+        let markdown = "a\n\n```rust title\nfn x() {}\n```\n\nb";
+        let content = parse_markdown(markdown, 1.5, &config);
+        assert_eq!(content.len(), 3);
+        let MarkdownContent::CodeBlock { language, code, .. } = &content[1] else {
+            panic!("expected a code block");
+        };
+        assert_eq!(language, "rust");
+        assert_eq!(code, "fn x() {}");
+        assert_eq!(rendered("a\n\n```\nx\n```\n\nb"), "ab");
     }
 }
