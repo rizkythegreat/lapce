@@ -38,6 +38,7 @@ use crate::{
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     doc::relative_time,
     editor::location::{EditorLocation, EditorPosition},
+    keypress::KeyPressFocus,
     listener::Listener,
     markdown::{
         Link, MarkdownContent, link_at, list_item_view, parse_markdown, table_view,
