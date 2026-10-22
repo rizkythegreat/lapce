@@ -1,6 +1,7 @@
 pub mod about;
 pub mod alert;
 pub mod app;
+pub mod claude_chat;
 pub mod code_action;
 pub mod code_lens;
 pub mod command;

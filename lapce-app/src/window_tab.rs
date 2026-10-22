@@ -54,6 +54,7 @@ use tracing::{Level, debug, error, event};
 use crate::{
     about::AboutData,
     alert::{AlertBoxData, AlertButton},
+    claude_chat::ClaudeChatData,
     code_action::{CodeActionData, CodeActionStatus},
     command::{
         CommandExecuted, CommandKind, InternalCommand, LapceCommand,
@@ -182,6 +183,7 @@ pub struct WindowTabData {
     pub code_action: RwSignal<CodeActionData>,
     pub code_lens: RwSignal<Option<ViewId>>,
     pub source_control: SourceControlData,
+    pub claude_chat: ClaudeChatData,
     pub rename: RenameData,
     pub global_search: GlobalSearchData,
     pub call_hierarchy_data: CallHierarchyData,
@@ -403,6 +405,8 @@ impl WindowTabData {
             cx.create_rw_signal(CodeActionData::new(cx, common.clone()));
         let source_control =
             SourceControlData::new(cx, main_split.editors, common.clone());
+        let claude_chat =
+            ClaudeChatData::new(cx, main_split.editors, common.clone());
         let file_explorer =
             FileExplorerData::new(cx, main_split.editors, common.clone());
 
@@ -562,6 +566,7 @@ impl WindowTabData {
             code_action,
             code_lens: cx.create_rw_signal(None),
             source_control,
+            claude_chat,
             plugin,
             rename,
             global_search,
@@ -2431,6 +2436,9 @@ impl WindowTabData {
             Focus::Panel(PanelKind::SourceControl) => {
                 Some(keypress.key_down(event, &self.source_control))
             }
+            Focus::Panel(PanelKind::ClaudeChat) => {
+                Some(keypress.key_down(event, &self.claude_chat))
+            }
             _ => None,
         };
 
@@ -2719,7 +2727,8 @@ impl WindowTabData {
             PanelKind::Terminal
             | PanelKind::SourceControl
             | PanelKind::Search
-            | PanelKind::FileExplorer => self.is_panel_focused(kind),
+            | PanelKind::FileExplorer
+            | PanelKind::ClaudeChat => self.is_panel_focused(kind),
         };
         if should_hide {
             self.hide_panel(kind);

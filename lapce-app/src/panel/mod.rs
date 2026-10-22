@@ -1,4 +1,5 @@
 pub mod call_hierarchy_view;
+pub mod claude_chat_view;
 pub mod data;
 pub mod debug_view;
 pub mod document_symbol;

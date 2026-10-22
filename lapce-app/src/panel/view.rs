@@ -17,6 +17,7 @@ use floem::{
 };
 
 use super::{
+    claude_chat_view::claude_chat_panel,
     debug_view::debug_panel,
     global_search_view::global_search_panel,
     kind::PanelKind,
@@ -507,6 +508,9 @@ fn panel_view(
                     implementation_panel(window_tab_data.clone(), position)
                         .into_any()
                 }
+                PanelKind::ClaudeChat => {
+                    claude_chat_panel(window_tab_data.clone(), position).into_any()
+                }
             };
             view.style(|s| s.size_pct(100.0, 100.0))
         },
@@ -563,6 +567,7 @@ fn panel_picker(
                 PanelKind::DocumentSymbol => "Document Symbol",
                 PanelKind::References => "References",
                 PanelKind::Implementation => "Implementation",
+                PanelKind::ClaudeChat => "Claude",
             };
             let icon = p.svg_name();
             let is_active = {
