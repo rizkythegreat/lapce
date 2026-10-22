@@ -729,7 +729,6 @@ fn message_view(
 ) -> impl View {
     let role = msg.role;
     let first_in_turn = msg.first_in_turn;
-    let turn_label = if role == ChatRole::User { "You" } else { "Claude" };
     let opener = LinkOpener {
         workspace: workspace.clone(),
         internal_command,
@@ -737,50 +736,69 @@ fn message_view(
     let body = match role {
         ChatRole::User => container(text_view(msg.text, role, opener, config))
             .style(move |s| {
-                let bg = config.get().color(LapceColor::PANEL_CURRENT_BACKGROUND);
+                let config = config.get();
                 s.max_width_pct(85.0)
                     .padding_horiz(10.0)
-                    .padding_vert(6.0)
-                    .border_radius(8.0)
-                    .background(bg)
+                    .padding_vert(2.0)
+                    .border(1.0)
+                    .border_radius(6.0)
+                    .border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
             })
             .into_any(),
         ChatRole::Assistant => {
             let text = msg.text;
-            stack((
-                text_view(text, role, opener, config),
-                copy_button(move || text.get_untracked(), config),
-            ))
-            .style(|s| s.flex_col().width_full().items_start().gap(2.0))
+            bulleted(
+                LapceColor::EDITOR_DIM,
+                stack((
+                    text_view(text, role, opener, config),
+                    copy_button(move || text.get_untracked(), config),
+                ))
+                .style(|s| s.flex_col().width_full().items_start().gap(2.0)),
+                config,
+            )
             .into_any()
         }
         ChatRole::Tool => {
             tool_card(msg, workspace, internal_command, config).into_any()
         }
-        ChatRole::Error => container(text_view(msg.text, role, opener, config))
-            .style(move |s| {
-                s.width_full()
-                    .padding_left(8.0)
-                    .border_left(2.0)
-                    .border_color(config.get().color(LapceColor::LAPCE_ERROR))
-            })
-            .into_any(),
+        ChatRole::Error => bulleted(
+            LapceColor::LAPCE_ERROR,
+            text_view(msg.text, role, opener, config),
+            config,
+        )
+        .into_any(),
     };
-    stack((
-        label(move || turn_label.to_string()).style(move |s| {
-            s.font_bold()
-                .margin_bottom(2.0)
-                .color(config.get().color(LapceColor::EDITOR_DIM))
-                .apply_if(!first_in_turn, |s| s.hide())
-        }),
-        body,
-    ))
-    .style(move |s| {
-        s.flex_col()
-            .width_full()
-            .apply_if(role == ChatRole::User, |s| s.items_end())
-            .apply_if(first_in_turn, |s| s.margin_top(10.0))
+    container(body).style(move |s| {
+        s.width_full().apply_if(first_in_turn, |s| s.margin_top(10.0))
     })
+}
+
+/// A small dot in a gutter on the left, lined up with the first line of
+/// `body`, the rest of the block hangs after it
+fn bulleted(
+    color: &'static str,
+    body: impl View + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    const DOT: f64 = 7.0;
+    const GUTTER: f64 = 18.0;
+    stack((
+        empty().style(move |s| {
+            let config = config.get();
+            let line = config.ui.font_size() as f64 * CHAT_LINE_HEIGHT;
+            // Text blocks start with a 4px margin
+            s.size(DOT, DOT)
+                .min_width(DOT)
+                .margin_top(4.0 + (line - DOT) / 2.0)
+                .margin_right(GUTTER - DOT)
+                .border_radius(DOT / 2.0)
+                .background(config.color(color))
+        }),
+        container(body)
+            .style(|s| s.flex_grow(1.0f32).flex_basis(0.0).min_width(0.0)),
+    ))
+    .style(|s| s.width_full().items_start())
 }
 
 /// Markdown for prompts and replies, plain text for errors
