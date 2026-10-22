@@ -256,11 +256,18 @@ impl ClaudeChatData {
     }
 
     pub fn send(&self) {
+        let text = self.editor.doc().buffer.with_untracked(|b| b.to_string());
+        let text = text.trim();
+        // Headless Claude Code has no /clear, handle it here, even mid-turn
+        if text == "/clear" {
+            self.editor.reset();
+            self.popup_index.set(0);
+            self.new_session();
+            return;
+        }
         if self.busy.get_untracked() {
             return;
         }
-        let text = self.editor.doc().buffer.with_untracked(|b| b.to_string());
-        let text = text.trim();
         if text.is_empty() {
             // Enter on the empty input takes the suggested prompt
             if let Some(suggestion) = self.suggestion.get_untracked() {
