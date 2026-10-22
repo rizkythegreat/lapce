@@ -143,7 +143,22 @@ struct ChatProcess {
     stdin: ChildStdin,
     /// Started with `--dangerously-skip-permissions`
     skip_permissions: bool,
+    model: Option<&'static str>,
+    effort: Option<&'static str>,
 }
+
+/// Choices for `--model`, None leaves Claude Code's default
+pub const MODELS: [Option<&str>; 5] =
+    [None, Some("fable"), Some("opus"), Some("sonnet"), Some("haiku")];
+/// Choices for `--effort`, None leaves Claude Code's default
+pub const EFFORTS: [Option<&str>; 6] = [
+    None,
+    Some("low"),
+    Some("medium"),
+    Some("high"),
+    Some("xhigh"),
+    Some("max"),
+];
 
 /// Chat with Claude Code running headless (`claude -p` with stream-json).
 /// The process stays alive across turns; it is respawned with `--resume`
@@ -168,6 +183,8 @@ pub struct ClaudeChatData {
     pub suggestion: RwSignal<Option<String>>,
     /// Run tools without asking. Off on every launch.
     pub skip_permissions: RwSignal<bool>,
+    pub model: RwSignal<Option<&'static str>>,
+    pub effort: RwSignal<Option<&'static str>>,
     /// Pending tool approvals, oldest first
     pub permissions: RwSignal<im::Vector<PermissionRequest>>,
     /// Refreshed on spawn and after every turn, None until first answered
@@ -248,6 +265,8 @@ impl ClaudeChatData {
             commands_requested: Rc::new(Cell::new(false)),
             suggestion: cx.create_rw_signal(None),
             skip_permissions: cx.create_rw_signal(false),
+            model: cx.create_rw_signal(None),
+            effort: cx.create_rw_signal(None),
             permissions: cx.create_rw_signal(im::Vector::new()),
             usage: cx.create_rw_signal(None),
             process: Rc::new(RefCell::new(None)),
@@ -297,13 +316,14 @@ impl ClaudeChatData {
         self.suggestion.set(None);
         self.push(ChatRole::User, text.to_string());
 
-        // The permission mode is fixed at spawn, restart (and resume) on a toggle
+        // Permission mode, model and effort are fixed at spawn, restart (and
+        // resume) when one changes
         let skip = self.skip_permissions.get_untracked();
-        let stale = self
-            .process
-            .borrow()
-            .as_ref()
-            .is_some_and(|p| p.skip_permissions != skip);
+        let model = self.model.get_untracked();
+        let effort = self.effort.get_untracked();
+        let stale = self.process.borrow().as_ref().is_some_and(|p| {
+            p.skip_permissions != skip || p.model != model || p.effort != effort
+        });
         if stale {
             self.stop();
         }
@@ -578,6 +598,14 @@ impl ClaudeChatData {
         if skip_permissions {
             cmd.arg("--dangerously-skip-permissions");
         }
+        let model = self.model.get_untracked();
+        if let Some(model) = model {
+            cmd.args(["--model", model]);
+        }
+        let effort = self.effort.get_untracked();
+        if let Some(effort) = effort {
+            cmd.args(["--effort", effort]);
+        }
         if let Some(id) = self.session_id.get_untracked() {
             cmd.args(["--resume", &id]);
         }
@@ -622,6 +650,8 @@ impl ClaudeChatData {
             child,
             stdin,
             skip_permissions,
+            model,
+            effort,
         });
         // Ask for the slash commands, answered without an API request
         self.write_line(&json!({

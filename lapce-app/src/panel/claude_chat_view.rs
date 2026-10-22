@@ -28,7 +28,8 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     app::clickable_icon,
     claude_chat::{
-        ChatMessage, ChatRole, ClaudeChatData, PermissionDecision, PermissionRequest,
+        ChatMessage, ChatRole, ClaudeChatData, EFFORTS, MODELS, PermissionDecision,
+        PermissionRequest,
         PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits, UsageWindow,
         mention_query,
     },
@@ -175,7 +176,19 @@ pub fn claude_chat_panel(
                 .border_color(config.color(LapceColor::LAPCE_BORDER))
                 .background(config.color(LapceColor::EDITOR_BACKGROUND))
         }),
-        usage_view(chat.usage, config),
+        // Applies from the next message, the process restarts on the same session
+        stack((
+            cycle_button("Model", chat.model, &MODELS, config),
+            cycle_button("Effort", chat.effort, &EFFORTS, config),
+            empty().style(|s| s.flex_grow(1.0f32)),
+            usage_view(chat.usage, config),
+        ))
+        .style(|s| {
+            s.items_center()
+                .margin_top(-6.0)
+                .padding_horiz(6.0)
+                .padding_bottom(6.0)
+        }),
     ))
     // Keeps the window from opening the dropped file in an editor
     .on_event(EventListener::DroppedFile, move |event| {
@@ -263,12 +276,12 @@ fn header(
     })
 }
 
-fn text_button(
-    text: impl Fn() -> &'static str + 'static,
+fn text_button<S: std::fmt::Display + 'static>(
+    text: impl Fn() -> S + 'static,
     on_click: impl Fn() + 'static,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    label(move || text().to_string())
+    label(text)
         .on_click_stop(move |_| on_click())
         .style(move |s| {
             let config = config.get();
@@ -281,6 +294,26 @@ fn text_button(
                 })
                 .selectable(false)
         })
+}
+
+/// Steps through `choices` on each click, None shows as "default"
+fn cycle_button(
+    name: &'static str,
+    value: RwSignal<Option<&'static str>>,
+    choices: &'static [Option<&'static str>],
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    container(text_button(
+        move || format!("{name}: {}", value.get().unwrap_or("default")),
+        move || {
+            value.update(|value| {
+                let i = choices.iter().position(|c| *c == *value).unwrap_or(0);
+                *value = choices[(i + 1) % choices.len()];
+            })
+        },
+        config,
+    ))
+    .style(move |s| s.color(config.get().color(LapceColor::EDITOR_DIM)))
 }
 
 /// "Thinking...", "Running Bash..." or "Waiting for approval..." while busy
@@ -346,9 +379,7 @@ fn usage_view(
         )
     })
     .style(move |s| {
-        s.margin_top(-6.0)
-            .padding_horiz(14.0)
-            .padding_bottom(6.0)
+        s.padding_horiz(8.0)
             .color(config.get().color(LapceColor::EDITOR_DIM))
             .selectable(false)
             .apply_if(usage.get().is_none(), |s| s.hide())
