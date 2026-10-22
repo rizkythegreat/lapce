@@ -161,6 +161,14 @@ struct ChatProcess {
     effort: Option<String>,
 }
 
+/// `--permission-mode` values offered in the input toolbar, with their labels
+pub const PERMISSION_MODES: [(&str, &str); 4] = [
+    ("default", "Ask permissions"),
+    ("acceptEdits", "Edit automatically"),
+    ("plan", "Plan mode"),
+    ("bypassPermissions", "Skip permissions"),
+];
+
 /// A model Claude Code offers this account, from its `initialize` answer
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModelInfo {
@@ -202,8 +210,9 @@ pub struct ClaudeChatData {
     commands_requested: Rc<Cell<bool>>,
     /// Claude Code's guess at the next prompt, shown in the empty input
     pub suggestion: RwSignal<Option<String>>,
-    /// Run tools without asking. Off on every launch.
-    pub skip_permissions: RwSignal<bool>,
+    /// A `PERMISSION_MODES` value, "default" asks. Back to it on every
+    /// launch.
+    pub permission_mode: RwSignal<&'static str>,
     /// Models from Claude Code, empty until its first process answers
     pub models: RwSignal<Vec<ModelInfo>>,
     /// None leaves Claude Code's default
@@ -291,7 +300,7 @@ impl ClaudeChatData {
             popup_index: cx.create_rw_signal(0),
             commands_requested: Rc::new(Cell::new(false)),
             suggestion: cx.create_rw_signal(None),
-            skip_permissions: cx.create_rw_signal(false),
+            permission_mode: cx.create_rw_signal("default"),
             models: cx.create_rw_signal(Vec::new()),
             model: cx.create_rw_signal(None),
             effort: cx.create_rw_signal(None),
@@ -544,9 +553,8 @@ impl ClaudeChatData {
     }
 
     /// Switches the running process too, it was started allowing the bypass
-    pub fn set_skip_permissions(&self, skip: bool) {
-        self.skip_permissions.set(skip);
-        let mode = if skip { "bypassPermissions" } else { "default" };
+    pub fn set_permission_mode(&self, mode: &'static str) {
+        self.permission_mode.set(mode);
         self.control(
             "lapce-permission-mode",
             json!({ "subtype": "set_permission_mode", "mode": mode }),
@@ -731,8 +739,9 @@ impl ClaudeChatData {
         ]);
         // Lets the permission toggle switch to bypass without a restart
         cmd.arg("--allow-dangerously-skip-permissions");
-        if self.skip_permissions.get_untracked() {
-            cmd.args(["--permission-mode", "bypassPermissions"]);
+        let mode = self.permission_mode.get_untracked();
+        if mode != "default" {
+            cmd.args(["--permission-mode", mode]);
         }
         let model = self.model.get_untracked();
         if let Some(model) = &model {

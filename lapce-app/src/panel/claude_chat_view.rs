@@ -29,7 +29,7 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     app::clickable_icon,
     claude_chat::{
-        ChatMessage, ChatRole, ClaudeChatData, PermissionRequest,
+        ChatMessage, ChatRole, ClaudeChatData, PERMISSION_MODES, PermissionRequest,
         PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits, UsageWindow,
         mention_query,
     },
@@ -315,29 +315,32 @@ fn input_toolbar(
     chat: ClaudeChatData,
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
-    let skip = chat.skip_permissions;
+    let mode = chat.permission_mode;
     let focus = chat.common.focus;
-    let mode = |skip: bool| {
-        let name = if skip { "Skip permissions" } else { "Ask permissions" };
-        name.to_string()
+    let mode_name = |mode: &str| {
+        let found = PERMISSION_MODES.iter().find(|(value, _)| *value == mode);
+        found.map_or(mode, |&(_, name)| name).to_string()
     };
     let slash_chat = chat.clone();
     let mode_chat = chat.clone();
     stack((
         container(text_button(
-            move || mode(skip.get()),
+            move || mode_name(mode.get()),
             move || {
-                let choices = vec![(false, mode(false)), (true, mode(true))];
+                let choices = PERMISSION_MODES
+                    .iter()
+                    .map(|&(value, name)| (value, name.to_string()))
+                    .collect::<Vec<_>>();
                 let pick_chat = mode_chat.clone();
-                show_choice_menu(skip.get_untracked(), choices, move |v| {
-                    pick_chat.set_skip_permissions(v)
+                show_choice_menu(mode.get_untracked(), choices, move |mode| {
+                    pick_chat.set_permission_mode(mode)
                 })
             },
             config,
         ))
         .style(move |s| {
             let config = config.get();
-            let color = if skip.get() {
+            let color = if mode.get() == "bypassPermissions" {
                 LapceColor::LAPCE_ERROR
             } else {
                 LapceColor::EDITOR_DIM
