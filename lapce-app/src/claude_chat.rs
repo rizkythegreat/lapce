@@ -110,6 +110,19 @@ impl PermissionRequest {
     pub fn can_always_allow(&self) -> bool {
         self.suggestions.as_array().is_some_and(|s| !s.is_empty())
     }
+
+    /// Answers in the order they are numbered, the number key picks one
+    pub fn options(&self) -> Vec<(&'static str, PermissionDecision)> {
+        let mut options = vec![("Yes", PermissionDecision::Allow)];
+        if self.can_always_allow() {
+            options.push((
+                "Yes, and don't ask again",
+                PermissionDecision::AlwaysAllow,
+            ));
+        }
+        options.push(("No", PermissionDecision::Deny));
+        options
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,7 +259,9 @@ impl KeyPressFocus for ClaudeChatData {
     }
 
     fn receive_char(&self, c: &str) {
-        self.editor.receive_char(c);
+        if !self.answer_by_number(c) {
+            self.editor.receive_char(c);
+        }
     }
 }
 
@@ -301,6 +316,21 @@ impl ClaudeChatData {
             self.editor.reset();
             self.popup_index.set(0);
             self.new_session();
+            return;
+        }
+        // Typed while a call waits for approval: deny it and tell Claude
+        // what to do instead
+        let pending = self.permissions.with_untracked(|p| p.front().cloned());
+        if let Some(request) = pending
+            && !text.is_empty()
+        {
+            self.editor.reset();
+            self.push(ChatRole::User, text.to_string());
+            self.respond_permission(
+                &request.request_id,
+                PermissionDecision::Deny,
+                Some(text),
+            );
             return;
         }
         if self.busy.get_untracked() {
@@ -381,6 +411,16 @@ impl ClaudeChatData {
     }
 
     pub fn answer_permission(&self, request_id: &str, decision: PermissionDecision) {
+        self.respond_permission(request_id, decision, None);
+    }
+
+    /// `message` tells Claude what to do instead of a denied call
+    fn respond_permission(
+        &self,
+        request_id: &str,
+        decision: PermissionDecision,
+        message: Option<&str>,
+    ) {
         let request = self.permissions.try_update(|permissions| {
             let i = permissions.iter().position(|p| p.request_id == request_id)?;
             Some(permissions.remove(i))
@@ -388,8 +428,30 @@ impl ClaudeChatData {
         let Some(request) = request.flatten() else {
             return;
         };
-        if let Err(e) = self.write_line(&permission_response(&request, decision)) {
+        let response = permission_response(&request, decision, message);
+        if let Err(e) = self.write_line(&response) {
             self.push(ChatRole::Error, format!("Failed to answer: {e}"));
+        }
+    }
+
+    /// The number key of an option on the pending approval card, only while
+    /// the input is empty so numbers can still be typed
+    fn answer_by_number(&self, c: &str) -> bool {
+        let Some(request) = self.permissions.with_untracked(|p| p.front().cloned())
+        else {
+            return false;
+        };
+        let empty = self.editor.doc().buffer.with_untracked(|b| b.is_empty());
+        let option = c
+            .parse::<usize>()
+            .ok()
+            .and_then(|n| request.options().get(n.wrapping_sub(1)).copied());
+        match option {
+            Some((_, decision)) if empty => {
+                self.answer_permission(&request.request_id, decision);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -1093,6 +1155,7 @@ fn parse_permission(event: &Value) -> Option<PermissionRequest> {
 fn permission_response(
     request: &PermissionRequest,
     decision: PermissionDecision,
+    message: Option<&str>,
 ) -> Value {
     let response = match decision {
         PermissionDecision::Allow => {
@@ -1103,9 +1166,10 @@ fn permission_response(
             "updatedInput": request.input,
             "updatedPermissions": request.suggestions,
         }),
-        PermissionDecision::Deny => {
-            json!({ "behavior": "deny", "message": "The user denied this in Lapce" })
-        }
+        PermissionDecision::Deny => json!({
+            "behavior": "deny",
+            "message": message.unwrap_or("The user denied this in Lapce"),
+        }),
     };
     json!({
         "type": "control_response",
@@ -1296,19 +1360,24 @@ mod tests {
         assert_eq!(request.detail, "Create file\ntouch a.txt");
         assert!(request.can_always_allow());
 
-        let allow = permission_response(&request, PermissionDecision::Allow);
+        let allow = permission_response(&request, PermissionDecision::Allow, None);
         assert_eq!(allow["response"]["request_id"], "r1");
         let inner = &allow["response"]["response"];
         assert_eq!(inner["behavior"], "allow");
         assert_eq!(inner["updatedInput"]["command"], "touch a.txt");
         assert!(inner["updatedPermissions"].is_null());
 
-        let always = permission_response(&request, PermissionDecision::AlwaysAllow);
+        let always =
+            permission_response(&request, PermissionDecision::AlwaysAllow, None);
         let rules = &always["response"]["response"]["updatedPermissions"];
         assert_eq!(rules[0]["type"], "addRules");
 
-        let deny = permission_response(&request, PermissionDecision::Deny);
+        let deny = permission_response(&request, PermissionDecision::Deny, None);
         assert_eq!(deny["response"]["response"]["behavior"], "deny");
+        let instead =
+            permission_response(&request, PermissionDecision::Deny, Some("Use ls"));
+        assert_eq!(instead["response"]["response"]["message"], "Use ls");
+        assert_eq!(request.options().len(), 3);
 
         let other = json!({"type": "control_request", "request": {"subtype": "x"}});
         assert!(parse_permission(&other).is_none());

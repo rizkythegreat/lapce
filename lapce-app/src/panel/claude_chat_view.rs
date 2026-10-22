@@ -21,7 +21,7 @@ use floem::{
     views::{
         Decorators, container, dyn_stack,
         editor::{core::register::Clipboard, text::SystemClipboard},
-        empty, label, rich_text, scroll, stack, svg,
+        empty, label, rich_text, scroll, stack, stack_from_iter, svg,
     },
 };
 
@@ -29,8 +29,7 @@ use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
     app::clickable_icon,
     claude_chat::{
-        ChatMessage, ChatRole, ClaudeChatData, EFFORTS, MODELS, PermissionDecision,
-        PermissionRequest,
+        ChatMessage, ChatRole, ClaudeChatData, EFFORTS, MODELS, PermissionRequest,
         PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits, UsageWindow,
         mention_query,
     },
@@ -516,6 +515,9 @@ fn permission_view(
     .style(|s| s.width_full())
 }
 
+/// "Allow Bash?", the call, then numbered answers like the Claude Code
+/// prompt. The number keys answer too, typing in the input denies and tells
+/// Claude what to do instead.
 fn permission_card(
     request: PermissionRequest,
     chat: ClaudeChatData,
@@ -523,17 +525,19 @@ fn permission_card(
 ) -> impl View {
     let title = request.title.clone();
     let detail = request.detail.clone();
-    let button = |text: &'static str, decision: PermissionDecision| {
-        let chat = chat.clone();
-        let id = request.request_id.clone();
-        text_button(
-            move || text,
-            move || chat.answer_permission(&id, decision),
-            config,
-        )
-    };
-    let always = button("Always allow", PermissionDecision::AlwaysAllow);
-    let can_always_allow = request.can_always_allow();
+    let id = request.request_id.clone();
+    let options = request.options().into_iter().enumerate().map(
+        move |(i, (text, decision))| {
+            let chat = chat.clone();
+            let id = id.clone();
+            permission_option(
+                format!("{}  {text}", i + 1),
+                i == 0,
+                move || chat.answer_permission(&id, decision),
+                config,
+            )
+        },
+    );
     stack((
         label(move || title.clone()).style(|s| s.font_bold()),
         rich_text(move || {
@@ -542,25 +546,60 @@ fn permission_card(
             plain_text(&detail, color, &config)
         })
         .style(|s| s.width_full().margin_vert(6.0)),
-        stack((
-            button("Allow", PermissionDecision::Allow),
-            container(always)
-                .style(move |s| s.apply_if(!can_always_allow, |s| s.hide())),
-            button("Deny", PermissionDecision::Deny),
-        ))
-        .style(|s| s.gap(4.0)),
+        stack_from_iter(options).style(|s| s.flex_col().width_full().gap(4.0)),
+        label(|| "Or type below to tell Claude what to do instead").style(
+            move |s| {
+                s.margin_top(6.0)
+                    .color(config.get().color(LapceColor::EDITOR_DIM))
+            },
+        ),
     ))
     .style(move |s| {
         let config = config.get();
         s.flex_col()
             .margin_horiz(10.0)
             .margin_bottom(6.0)
-            .padding(8.0)
+            .padding(10.0)
             .border(1.0)
-            .border_radius(6.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
-            .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
+            .border_radius(8.0)
+            .border_color(config.color(LapceColor::EDITOR_FOCUS))
+            .background(config.color(LapceColor::PANEL_BACKGROUND))
     })
+}
+
+/// A full width answer row, the first one stands out as the default
+fn permission_option(
+    text: String,
+    primary: bool,
+    on_click: impl Fn() + 'static,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    label(move || text.clone())
+        .on_click_stop(move |_| on_click())
+        .style(move |s| {
+            let config = config.get();
+            let s = s
+                .width_full()
+                .padding_horiz(10.0)
+                .padding_vert(5.0)
+                .border(1.0)
+                .border_radius(4.0)
+                .cursor(CursorStyle::Pointer)
+                .selectable(false);
+            if primary {
+                let bg = config.color(LapceColor::LAPCE_BUTTON_PRIMARY_BACKGROUND);
+                s.border_color(bg)
+                    .background(bg)
+                    .color(config.color(LapceColor::LAPCE_BUTTON_PRIMARY_FOREGROUND))
+            } else {
+                s.border_color(config.color(LapceColor::LAPCE_BORDER))
+                    .hover(|s| {
+                        s.background(
+                            config.color(LapceColor::PANEL_HOVERED_BACKGROUND),
+                        )
+                    })
+            }
+        })
 }
 
 fn command_popup(
