@@ -2471,7 +2471,7 @@ fn extra_styles_for_range(
 }
 
 /// "3 days ago" style age for a duration in seconds
-fn relative_time(secs: i64) -> String {
+pub(crate) fn relative_time(secs: i64) -> String {
     let (n, unit) = match secs {
         ..60 => return "just now".to_string(),
         ..3_600 => (secs / 60, "minute"),
