@@ -6,11 +6,12 @@ use std::{
     process::{Child, ChildStdin, Command, Stdio},
     rc::Rc,
     sync::mpsc::{Sender, channel},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 use chrono::{DateTime, Local};
 use floem::{
+    action::exec_after,
     ext_event::{create_ext_action, create_signal_from_channel},
     keyboard::Modifiers,
     reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
@@ -163,6 +164,10 @@ impl ContextUsage {
 /// Claude Code's own resume thresholds: past them the prompt cache is gone
 /// and the first message re-reads the whole context uncached
 const RESUME_IDLE_SECS: i64 = 70 * 60;
+
+/// A quiet Claude Code process is stopped after this to give its memory
+/// back, the next message resumes the session
+const IDLE_STOP: Duration = Duration::from_secs(15 * 60);
 const RESUME_TOKENS: u64 = 100_000;
 
 /// A resumed session idle and big enough that continuing costs a lot
@@ -290,6 +295,9 @@ pub struct ClaudeChatData {
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
     next_id: Rc<Cell<u64>>,
+    /// Bumped on every spawn and turn end, an idle stop timer acts only if
+    /// it is still the latest
+    idle_token: Rc<Cell<u64>>,
     tx: Sender<(u64, Value)>,
     pub common: Rc<CommonData>,
 }
@@ -380,6 +388,7 @@ impl ClaudeChatData {
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
+            idle_token: Rc::new(Cell::new(0)),
             tx,
             common,
         };
@@ -1038,7 +1047,24 @@ impl ClaudeChatData {
         self.request_settings();
         // A resumed session shows how full it is before the first message
         self.control("lapce-context", json!({ "subtype": "get_context_usage" }));
+        self.schedule_idle_stop();
         Ok(())
+    }
+
+    /// Stop the process once nothing happened for `IDLE_STOP`, unless a turn
+    /// or an approval is still pending
+    fn schedule_idle_stop(&self) {
+        let token = self.idle_token.get() + 1;
+        self.idle_token.set(token);
+        let chat = self.clone();
+        exec_after(IDLE_STOP, move |_| {
+            let quiet = chat.idle_token.get() == token
+                && !chat.busy.get_untracked()
+                && chat.permissions.with_untracked(|p| p.is_empty());
+            if quiet {
+                chat.stop();
+            }
+        });
     }
 
     /// Ask for plan usage, read from the claude.ai usage endpoint, no model request
@@ -1187,6 +1213,7 @@ impl ClaudeChatData {
             }
             Some("result") => {
                 self.busy.set(false);
+                self.schedule_idle_stop();
                 self.request_usage();
                 self.context.update(|context| {
                     if let Some(context) = context {

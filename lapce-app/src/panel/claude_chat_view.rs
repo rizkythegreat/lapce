@@ -64,6 +64,16 @@ pub fn claude_chat_panel(
     let workspace = chat.common.workspace.path.clone();
     let is_focused = move || focus.get() == Focus::Panel(PanelKind::ClaudeChat);
     let content_height = create_rw_signal(0.0);
+    // Scrolled to the bottom, so new output scrolls along. Scrolling up stops
+    // it, scrolling back down or sending a message resumes it.
+    let follow = create_rw_signal(true);
+    let viewport = create_rw_signal(Rect::ZERO);
+    create_effect(move |_| {
+        let last = messages.with(|m| m.last().map(|m| m.role));
+        if last == Some(ChatRole::User) {
+            follow.set(true);
+        }
+    });
     // Scroll content is unbounded, give it the visible width so text wraps
     let scroll_width = create_rw_signal(0.0);
     let drop_chat = chat.clone();
@@ -125,10 +135,18 @@ pub fn claude_chat_panel(
                     s.flex_col().width(scroll_width.get()).padding(12.0).gap(6.0)
                 }),
             )
-            // Follow the conversation as it grows
+            .on_scroll(move |rect| {
+                viewport.set(rect);
+                follow.set(rect.y1 >= content_height.get_untracked() - 30.0);
+            })
+            // Follow the conversation as it grows, unless reading above
             .ensure_visible(move || {
                 let height = content_height.get();
-                Rect::new(0.0, height - 1.0, 1.0, height)
+                if follow.get_untracked() {
+                    Rect::new(0.0, height - 1.0, 1.0, height)
+                } else {
+                    viewport.get_untracked()
+                }
             })
             .on_resize(move |rect| {
                 if scroll_width.get_untracked() != rect.width() {
