@@ -160,6 +160,23 @@ impl ContextUsage {
     }
 }
 
+/// Claude Code's own resume thresholds: past them the prompt cache is gone
+/// and the first message re-reads the whole context uncached
+const RESUME_IDLE_SECS: i64 = 70 * 60;
+const RESUME_TOKENS: u64 = 100_000;
+
+/// A resumed session idle and big enough that continuing costs a lot
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResumeWarning {
+    pub idle_secs: i64,
+    pub tokens: u64,
+}
+
+fn resume_warning(idle_secs: i64, tokens: u64) -> Option<ResumeWarning> {
+    (idle_secs >= RESUME_IDLE_SECS && tokens >= RESUME_TOKENS)
+        .then_some(ResumeWarning { idle_secs, tokens })
+}
+
 /// Model and effort a running Claude Code actually uses, settings files
 /// included, from its `get_settings`
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -258,6 +275,10 @@ pub struct ClaudeChatData {
     pub context: RwSignal<Option<ContextUsage>>,
     /// What "default" model and effort turn out to be, None until answered
     pub applied: RwSignal<Option<AppliedSettings>>,
+    /// Shown once after resuming an idle, large session
+    pub resume_warning: RwSignal<Option<ResumeWarning>>,
+    /// How long the session being resumed sat idle, until its context is known
+    resume_idle: Rc<Cell<Option<i64>>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -343,6 +364,8 @@ impl ClaudeChatData {
             usage: cx.create_rw_signal(None),
             context: cx.create_rw_signal(None),
             applied: cx.create_rw_signal(None),
+            resume_warning: cx.create_rw_signal(None),
+            resume_idle: Rc::new(Cell::new(None)),
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -403,6 +426,7 @@ impl ClaudeChatData {
         self.editor.reset();
         self.popup_index.set(0);
         self.suggestion.set(None);
+        self.resume_warning.set(None);
         self.push(ChatRole::User, text.to_string());
 
         // Effort is fixed at spawn, restart (and resume) when it changes
@@ -667,6 +691,12 @@ impl ClaudeChatData {
         }
     }
 
+    /// Summarize the session before going on, the resume warning's way out
+    pub fn compact(&self) {
+        self.set_input("/compact".to_string());
+        self.send();
+    }
+
     fn set_input(&self, text: String) {
         let len = text.len();
         self.editor.doc().reload(Rope::from(text), true);
@@ -712,6 +742,7 @@ impl ClaudeChatData {
     pub fn new_session(&self) {
         self.stop();
         self.context.set(None);
+        self.resume_warning.set(None);
         self.session_id.set(None);
         self.messages.set(im::Vector::new());
         self.show_sessions.set(false);
@@ -734,6 +765,16 @@ impl ClaudeChatData {
         self.session_id.set(Some(id.clone()));
         self.messages.set(im::Vector::new());
         self.show_sessions.set(false);
+        self.resume_warning.set(None);
+        // ponytail: file mtime as last activity, like the sessions list; read
+        // the last message timestamp if renames or tools start touching it
+        let idle = self.sessions_dir().and_then(|dir| {
+            let path = dir.join(format!("{id}.jsonl"));
+            let modified = path.metadata().ok()?.modified().ok()?;
+            let idle = SystemTime::now().duration_since(modified).ok()?;
+            Some(idle.as_secs() as i64)
+        });
+        self.resume_idle.set(idle);
         // Attach to the session now, not on the first message. Spawning makes
         // no model request.
         if let Err(e) = self.spawn() {
@@ -862,6 +903,8 @@ impl ClaudeChatData {
         }))?;
         self.request_usage();
         self.request_settings();
+        // A resumed session shows how full it is before the first message
+        self.control("lapce-context", json!({ "subtype": "get_context_usage" }));
         Ok(())
     }
 
@@ -914,6 +957,18 @@ impl ClaudeChatData {
                 let applied = &event["response"]["response"]["applied"];
                 if applied.is_object() {
                     self.applied.set(Some(parse_applied(applied)));
+                }
+            }
+            Some("control_response")
+                if event["response"]["request_id"] == "lapce-context" =>
+            {
+                if let Some(usage) = parse_context(&event["response"]["response"]) {
+                    if let Some(idle) = self.resume_idle.take() {
+                        self.resume_warning.set(resume_warning(idle, usage.tokens));
+                    }
+                    // Keep the cost, only a turn's result reports it
+                    let cost = self.context.with_untracked(|c| c.as_ref()?.cost);
+                    self.context.set(Some(ContextUsage { cost, ..usage }));
                 }
             }
             Some("control_response")
@@ -1215,6 +1270,17 @@ fn parse_applied(applied: &Value) -> AppliedSettings {
         model: field("model"),
         effort: field("effort"),
     }
+}
+
+/// From `get_context_usage`, which counts the whole history without a model
+/// request
+fn parse_context(response: &Value) -> Option<ContextUsage> {
+    Some(ContextUsage {
+        tokens: response["totalTokens"].as_u64()?,
+        window: response["maxTokens"].as_u64(),
+        cost: None,
+        model: response["model"].as_str().unwrap_or_default().to_string(),
+    })
 }
 
 fn parse_models(models: &Value) -> Option<Vec<ModelInfo>> {
@@ -1544,6 +1610,29 @@ mod tests {
         let applied = parse_applied(&applied);
         assert_eq!(applied.effort.as_deref(), Some("xhigh"));
         assert_eq!(parse_applied(&json!({"effort": null})).model, None);
+    }
+
+    #[test]
+    fn resume_warning_needs_idle_and_size() {
+        let hour = 3_600;
+        assert!(resume_warning(2 * hour, 427_805).is_some());
+        assert!(resume_warning(30 * 60, 427_805).is_none());
+        assert!(resume_warning(2 * hour, 20_000).is_none());
+        assert!(resume_warning(RESUME_IDLE_SECS, RESUME_TOKENS).is_some());
+    }
+
+    #[test]
+    fn context_from_usage_request() {
+        let response = json!({
+            "totalTokens": 427805,
+            "maxTokens": 1000000,
+            "model": "claude-opus-5-5",
+        });
+        let context = parse_context(&response).unwrap();
+        assert_eq!(context.tokens, 427805);
+        assert_eq!(context.percent().map(|p| p.round()), Some(43.0));
+        assert_eq!(context.model, "claude-opus-5-5");
+        assert!(parse_context(&json!({})).is_none());
     }
 
     #[test]

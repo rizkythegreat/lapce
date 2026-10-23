@@ -145,6 +145,7 @@ pub fn claude_chat_panel(
                 .apply_if(show_sessions.get(), |s| s.hide())
         }),
         working_view(chat.clone(), config),
+        resume_warning_view(chat.clone(), config),
         permission_view(chat.clone(), config),
         command_popup(chat.clone(), config),
         stack((
@@ -763,6 +764,65 @@ fn permission_view(
         move |request| permission_card(request, chat.clone(), config),
     )
     .style(|s| s.width_full())
+}
+
+/// Claude Code's resume prompt: an idle session lost its prompt cache, so the
+/// next message pays for the whole context again. Any sent message hides it.
+fn resume_warning_view(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let warning = chat.resume_warning;
+    let text = move || {
+        let Some(w) = warning.get() else {
+            return String::new();
+        };
+        format!(
+            "Last active {} with {} tokens of context. Continuing re-reads all \
+             of it without cache and uses a large share of your usage limits.",
+            relative_time(w.idle_secs),
+            compact_count(w.tokens),
+        )
+    };
+    let compact = chat.clone();
+    let fresh = chat.clone();
+    stack((
+        label(|| "Resume this session?").style(|s| s.font_bold()),
+        label(text).style(|s| s.width_full().margin_vert(6.0)),
+        stack((
+            permission_option(
+                "Compact first".to_string(),
+                true,
+                move || compact.compact(),
+                config,
+            ),
+            permission_option(
+                "Continue as is".to_string(),
+                false,
+                move || warning.set(None),
+                config,
+            ),
+            permission_option(
+                "New session".to_string(),
+                false,
+                move || fresh.new_session(),
+                config,
+            ),
+        ))
+        .style(|s| s.flex_col().width_full().gap(4.0)),
+    ))
+    .style(move |s| {
+        let config = config.get();
+        s.flex_col()
+            .margin_horiz(10.0)
+            .margin_bottom(6.0)
+            .padding(10.0)
+            .border(1.0)
+            .border_radius(8.0)
+            .border_color(config.color(LapceColor::LAPCE_WARN))
+            .background(config.color(LapceColor::PANEL_BACKGROUND))
+            .apply_if(warning.with(|w| w.is_none()), |s| s.hide())
+    })
 }
 
 /// "Allow Bash?", the call, then numbered answers like the Claude Code
