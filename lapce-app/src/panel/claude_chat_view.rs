@@ -172,6 +172,7 @@ pub fn claude_chat_panel(
                     Some(suggestion) => format!("{suggestion}  (Enter to use)"),
                     None => "Ask Claude".to_string(),
                 })
+                .wrap()
                 // Grows with its lines, scrolls past this
                 .style(|s| {
                     s.width_full().min_width(0.0).padding(6.0).max_height(200.0)

@@ -231,6 +231,8 @@ fn text_input_full<T: KeyPressFocus + 'static>(
         cursor_pos: Point::ZERO,
         on_cursor_pos: None,
         hide_cursor: editor.cursor_info.hidden,
+        wrap: false,
+        wrap_width: None,
         style: Default::default(),
     }
     .style(move |s| {
@@ -328,6 +330,10 @@ pub struct TextInput {
     cursor_pos: Point,
     on_cursor_pos: Option<Box<dyn Fn(Point)>>,
     hide_cursor: RwSignal<bool>,
+    /// Wrap long lines to the input's width instead of scrolling sideways
+    wrap: bool,
+    /// Width the text layout is wrapped at
+    wrap_width: Option<f32>,
     config: ReadSignal<Arc<LapceConfig>>,
     style: Extractor,
 }
@@ -339,6 +345,13 @@ impl TextInput {
             let placeholder = placeholder();
             id.update_state(TextInputState::Placeholder(placeholder));
         });
+        self
+    }
+
+    /// Wrap long lines, the input grows downward instead of scrolling
+    /// sideways
+    pub fn wrap(mut self) -> Self {
+        self.wrap = true;
         self
     }
 
@@ -396,6 +409,9 @@ impl TextInput {
             AttrsList::new(attrs.clone()),
             None,
         );
+        if let Some(width) = self.wrap_width {
+            text_layout.set_size(width, f32::MAX);
+        }
         self.text_layout.set(Some(text_layout));
 
         let mut placeholder_text_layout = TextLayout::new();
@@ -625,6 +641,13 @@ impl View for TextInput {
         text_rect.x0 += padding_left;
         text_rect.x1 -= padding_right;
         self.text_rect = text_rect;
+
+        let width = text_rect.width() as f32;
+        if self.wrap && width > 0.0 && self.wrap_width != Some(width) {
+            self.wrap_width = Some(width);
+            self.set_text_layout();
+            self.id.request_layout();
+        }
 
         self.clamp_text_viewport(self.text_viewport);
 
