@@ -2495,6 +2495,7 @@ fn should_blink(
                 | Focus::Panel(PanelKind::Plugin)
                 | Focus::Panel(PanelKind::Search)
                 | Focus::Panel(PanelKind::SourceControl)
+                | Focus::Panel(PanelKind::ClaudeChat)
         ) {
             return true;
         }
