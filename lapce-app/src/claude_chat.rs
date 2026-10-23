@@ -340,8 +340,20 @@ impl KeyPressFocus for ClaudeChatData {
                 self.select_popup_item();
                 CommandExecuted::Yes
             }
+            // Shift+Enter starts a new line, plain Enter sends
+            CommandKind::Edit(EditCommand::InsertNewLine) if mods.shift() => {
+                self.editor.receive_char("\n");
+                CommandExecuted::Yes
+            }
             CommandKind::Edit(EditCommand::InsertNewLine) => {
                 self.send();
+                CommandExecuted::Yes
+            }
+            // Esc interrupts the running turn, like the CLI
+            CommandKind::Edit(EditCommand::NormalMode)
+                if self.busy.get_untracked() =>
+            {
+                self.stop();
                 CommandExecuted::Yes
             }
             CommandKind::Edit(EditCommand::ClipboardPaste) if self.paste_long() => {

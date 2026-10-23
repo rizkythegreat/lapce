@@ -10,7 +10,6 @@ use floem::{
     IntoView, View,
     action::{exec_after, show_context_menu},
     event::{Event, EventListener, EventPropagation},
-    keyboard::{Key, NamedKey},
     kurbo::Rect,
     menu::{Menu, MenuItem},
     peniko::Color,
@@ -77,7 +76,6 @@ pub fn claude_chat_panel(
     // Scroll content is unbounded, give it the visible width so text wraps
     let scroll_width = create_rw_signal(0.0);
     let drop_chat = chat.clone();
-    let newline_chat = chat.clone();
 
     {
         let chat = chat.clone();
@@ -173,18 +171,6 @@ pub fn claude_chat_panel(
                 .placeholder(move || match suggestion.get() {
                     Some(suggestion) => format!("{suggestion}  (Enter to use)"),
                     None => "Ask Claude".to_string(),
-                })
-                // Shift+Enter starts a new line, plain Enter sends
-                .on_event(EventListener::KeyDown, move |event| {
-                    let Event::KeyDown(key) = event else {
-                        return EventPropagation::Continue;
-                    };
-                    let enter = key.key.logical_key == Key::Named(NamedKey::Enter);
-                    if enter && key.modifiers.shift() {
-                        newline_chat.editor.receive_char("\n");
-                        return EventPropagation::Stop;
-                    }
-                    EventPropagation::Continue
                 })
                 // Grows with its lines, scrolls past this
                 .style(|s| {

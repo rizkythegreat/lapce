@@ -285,6 +285,12 @@ when = "!list_focus && !input_focus"
 mode = "i"
 
 [[keymaps]]
+key = "shift+enter"
+command = "insert_new_line"
+when = "!list_focus && !input_focus"
+mode = "i"
+
+[[keymaps]]
 key = "tab"
 command = "focus_replace_editor"
 when = "search_focus"
