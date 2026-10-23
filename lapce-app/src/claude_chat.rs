@@ -982,6 +982,8 @@ impl ClaudeChatData {
         ]);
         // Lets the permission toggle switch to bypass without a restart
         cmd.arg("--allow-dangerously-skip-permissions");
+        // Browser tools from the Claude in Chrome extension
+        cmd.arg("--chrome");
         let mode = self.permission_mode.get_untracked();
         if mode != "default" {
             cmd.args(["--permission-mode", mode]);
