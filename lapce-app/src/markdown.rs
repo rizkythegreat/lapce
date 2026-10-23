@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{ops::Range, rc::Rc, sync::Arc};
 
 use floem::{
     IntoView, View,
@@ -119,6 +119,155 @@ impl<'a> Builder<'a> {
     }
 }
 
+/// Shared by `parse_markdown` and `top_level_blocks` so blocks split the
+/// way they parse
+fn parser_options() -> Options {
+    Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_HEADING_ATTRIBUTES
+}
+
+/// Byte ranges of the top level blocks: paragraphs, headings, lists, code
+/// blocks, tables, rules. Blank lines between them belong to none.
+pub fn top_level_blocks(text: &str) -> Vec<Range<usize>> {
+    let mut blocks = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0;
+    let parser = Parser::new_ext(text, parser_options());
+    for (event, range) in parser.into_offset_iter() {
+        match event {
+            Event::Start(_) => {
+                if depth == 0 {
+                    start = range.start;
+                }
+                depth += 1;
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    blocks.push(start..range.end);
+                }
+            }
+            // A rule or other block that comes as a single event
+            _ if depth == 0 => blocks.push(range),
+            _ => {}
+        }
+    }
+    blocks
+}
+
+/// One rendered item of a streamed reply, `key` stays the same while the
+/// item does
+pub struct StreamedItem {
+    pub key: u64,
+    pub content: Rc<MarkdownContent>,
+    /// Text right after text of the block before, wants a blank line's gap
+    /// that used to sit inside one layout
+    pub gap_before: bool,
+}
+
+/// Markdown of a reply that grows while Claude writes it. Every top level
+/// block but the last is final, so only the last one is parsed again on each
+/// update and the others keep their items and keys.
+#[derive(Default)]
+pub struct StreamedMarkdown {
+    /// Text up to the end of the last final block
+    prefix: String,
+    finals: Vec<(u64, Rc<MarkdownContent>, bool)>,
+    config: Option<Arc<LapceConfig>>,
+    /// Bumped when starting over, so old views never pass for new ones
+    generation: u64,
+    tail_version: u64,
+}
+
+/// Keys of final items, by block start and index in the block
+fn final_key(generation: u64, start: usize, index: usize) -> u64 {
+    let start = start as u64 & 0xffff_ffff;
+    ((generation & 0x7fff) << 48) | (start << 16) | index as u64
+}
+
+/// Keys of the last block's items, new on every update so its views rebuild
+fn tail_key(version: u64, index: usize) -> u64 {
+    (1 << 63) | (version << 16) | index as u64
+}
+
+impl StreamedMarkdown {
+    pub fn update(
+        &mut self,
+        text: &str,
+        line_height: f64,
+        config: &Arc<LapceConfig>,
+    ) -> Vec<StreamedItem> {
+        let same_config =
+            self.config.as_ref().is_some_and(|c| Arc::ptr_eq(c, config));
+        // A new config or text that does not extend the last one starts over
+        if !same_config || !text.starts_with(&self.prefix) {
+            *self = Self {
+                config: Some(config.clone()),
+                generation: self.generation + 1,
+                tail_version: self.tail_version,
+                ..Self::default()
+            };
+        }
+        self.tail_version += 1;
+
+        let base = self.prefix.len();
+        let blocks = top_level_blocks(&text[base..]);
+        let Some((last, done)) = blocks.split_last() else {
+            return self.items(Vec::new());
+        };
+        for block in done {
+            let start = base + block.start;
+            let source = &text[start..base + block.end];
+            let parsed = parse_markdown(source, line_height, config);
+            let previous_text = self.ends_with_text();
+            for (index, content) in parsed.into_iter().enumerate() {
+                let is_text = matches!(content, MarkdownContent::Text(..));
+                let gap = index == 0 && is_text && previous_text;
+                let key = final_key(self.generation, start, index);
+                self.finals.push((key, Rc::new(content), gap));
+            }
+        }
+        if let Some(block) = done.last() {
+            self.prefix = text[..base + block.end].to_string();
+        }
+
+        let source = &text[base + last.start..base + last.end];
+        let tail = parse_markdown(source, line_height, config);
+        self.items(tail)
+    }
+
+    fn ends_with_text(&self) -> bool {
+        self.finals.last().is_some_and(|(_, content, _)| {
+            matches!(**content, MarkdownContent::Text(..))
+        })
+    }
+
+    fn items(&self, tail: Vec<MarkdownContent>) -> Vec<StreamedItem> {
+        let mut items: Vec<_> = self
+            .finals
+            .iter()
+            .map(|(key, content, gap)| StreamedItem {
+                key: *key,
+                content: content.clone(),
+                gap_before: *gap,
+            })
+            .collect();
+        let previous_text = self.ends_with_text();
+        for (index, content) in tail.into_iter().enumerate() {
+            let is_text = matches!(content, MarkdownContent::Text(..));
+            items.push(StreamedItem {
+                key: tail_key(self.tail_version, index),
+                content: Rc::new(content),
+                gap_before: index == 0 && is_text && previous_text,
+            });
+        }
+        items
+    }
+}
+
 pub fn parse_markdown(
     text: &str,
     line_height: f64,
@@ -139,14 +288,7 @@ pub fn parse_markdown(
 
     let mut tag_stack: SmallVec<[(usize, Tag); 4]> = SmallVec::new();
 
-    let parser = Parser::new_ext(
-        text,
-        Options::ENABLE_TABLES
-            | Options::ENABLE_FOOTNOTES
-            | Options::ENABLE_STRIKETHROUGH
-            | Options::ENABLE_TASKLISTS
-            | Options::ENABLE_HEADING_ATTRIBUTES,
-    );
+    let parser = Parser::new_ext(text, parser_options());
     // Line breaks owed to the next entry, 2 leaves a blank line between blocks.
     // Deferred so that we don't emit newlines at the very end of the generation
     let mut add_newlines = 0;
@@ -575,9 +717,13 @@ pub fn from_plaintext(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use floem::text::TextLayout;
 
-    use super::{MarkdownContent, parse_markdown};
+    use super::{
+        MarkdownContent, StreamedMarkdown, parse_markdown, top_level_blocks,
+    };
     use crate::config::LapceConfig;
 
     fn text(layout: &TextLayout) -> String {
@@ -589,7 +735,11 @@ mod tests {
     /// as their fence and table rows with cells split by `|`
     fn rendered(markdown: &str) -> String {
         let config = LapceConfig::default_lapce_config();
-        let items: Vec<_> = parse_markdown(markdown, 1.5, &config)
+        rendered_items(&parse_markdown(markdown, 1.5, &config))
+    }
+
+    fn rendered_items(contents: &[MarkdownContent]) -> String {
+        let items: Vec<_> = contents
             .iter()
             .map(|content| match content {
                 MarkdownContent::Text(layout, _) => text(layout),
@@ -619,6 +769,63 @@ mod tests {
             })
             .collect();
         items.join("\n")
+    }
+
+    const REPLY: &str = "# Title\n\nPara one\nline two.\n\n- a\n- b\n\n  more b\n\n\
+        ```rust\nfn a() {}\n\nfn b() {}\n```\n\n| x | y |\n|---|---|\n| 1 | 2 |\n\n\
+        ---\n\nEnd.";
+
+    #[test]
+    fn blocks_split_at_top_level() {
+        let blocks: Vec<_> = top_level_blocks(REPLY)
+            .into_iter()
+            .map(|range| &REPLY[range])
+            .collect();
+        assert_eq!(blocks.len(), 7);
+        assert_eq!(blocks[0].trim_end(), "# Title");
+        assert!(blocks[2].trim_end().ends_with("more b"), "loose list is one block");
+        assert!(blocks[3].contains("\n\nfn b()"), "code keeps its blank line");
+        assert_eq!(blocks[6], "End.");
+        // An unclosed fence runs to the end
+        assert_eq!(top_level_blocks("a\n\n```\nx\n\ny").len(), 2);
+    }
+
+    /// Streams `REPLY` in chunks of `size` bytes, returns the last items
+    fn streamed(size: usize) -> Vec<MarkdownContent> {
+        let config = Arc::new(LapceConfig::default_lapce_config());
+        let mut markdown = StreamedMarkdown::default();
+        let mut items = Vec::new();
+        for end in (size..REPLY.len()).step_by(size).chain([REPLY.len()]) {
+            items = markdown.update(&REPLY[..end], 1.5, &config);
+        }
+        items.iter().map(|item| (*item.content).clone()).collect()
+    }
+
+    #[test]
+    fn streaming_matches_one_parse() {
+        let config = LapceConfig::default_lapce_config();
+        let expected: Vec<_> = top_level_blocks(REPLY)
+            .into_iter()
+            .flat_map(|range| parse_markdown(&REPLY[range], 1.5, &config))
+            .collect();
+        let expected = rendered_items(&expected);
+        assert_eq!(rendered_items(&streamed(1)), expected);
+        assert_eq!(rendered_items(&streamed(7)), expected);
+        assert_eq!(rendered_items(&streamed(REPLY.len())), expected);
+    }
+
+    #[test]
+    fn final_blocks_keep_their_keys() {
+        let config = Arc::new(LapceConfig::default_lapce_config());
+        let mut markdown = StreamedMarkdown::default();
+        let first = markdown.update("a\n\nb", 1.5, &config);
+        let second = markdown.update("a\n\nbc", 1.5, &config);
+        assert_eq!(first[0].key, second[0].key, "final block kept");
+        assert_ne!(first[1].key, second[1].key, "last block rebuilt");
+        assert!(second[1].gap_before, "text after text keeps a blank line");
+        // Text that does not extend the old one starts over with new keys
+        let replaced = markdown.update("z\n\nb", 1.5, &config);
+        assert_ne!(replaced[0].key, second[0].key);
     }
 
     #[test]

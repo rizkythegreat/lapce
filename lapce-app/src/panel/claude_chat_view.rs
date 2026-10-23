@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, atomic::AtomicU64},
@@ -41,7 +42,8 @@ use crate::{
     keypress::KeyPressFocus,
     listener::Listener,
     markdown::{
-        Link, MarkdownContent, link_at, list_item_view, parse_markdown, table_view,
+        Link, MarkdownContent, StreamedItem, StreamedMarkdown, link_at,
+        list_item_view, table_view,
     },
     panel::data::PanelData,
     text_input::TextInputBuilder,
@@ -1096,6 +1098,9 @@ fn text_view(
     config: ReadSignal<Arc<LapceConfig>>,
 ) -> impl View {
     let id = AtomicU64::new(0);
+    // Streaming replies only parse their last block again, the rest keep
+    // their views
+    let markdown = RefCell::new(StreamedMarkdown::default());
     dyn_stack(
         move || {
             let config = config.get();
@@ -1103,19 +1108,31 @@ fn text_view(
                 ChatRole::Error => {
                     let color = config.color(LapceColor::LAPCE_ERROR);
                     let layout = plain_text(text, color, &config);
-                    vec![MarkdownContent::Text(layout, Vec::new())]
+                    vec![StreamedItem {
+                        key: id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                        content: Rc::new(MarkdownContent::Text(layout, Vec::new())),
+                        gap_before: false,
+                    }]
                 }
-                _ => parse_markdown(text, CHAT_LINE_HEIGHT, &config),
+                _ => markdown.borrow_mut().update(text, CHAT_LINE_HEIGHT, &config),
             })
         },
-        move |_| id.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        move |content| match content {
+        |item| item.key,
+        move |item| match (*item.content).clone() {
             // A bubble shrinks to short prompts, so only cap the width there.
             // Replies stop near 80 characters so long lines stay readable.
-            // List items sit tight, other blocks get a little room.
+            // List items sit tight, other blocks get a little room. Text after
+            // text of another block keeps the blank line between them.
             MarkdownContent::Text(layout, links) => {
+                let gap = item.gap_before;
                 container(link_text(layout, links, opener.clone()))
-                    .style(move |s| text_width(s, role, config).margin_vert(4.0))
+                    .style(move |s| {
+                        let line = config.get().ui.font_size() as f64
+                            * CHAT_LINE_HEIGHT;
+                        text_width(s, role, config)
+                            .margin_vert(4.0)
+                            .apply_if(gap, |s| s.margin_top(line - 4.0))
+                    })
                     .into_any()
             }
             MarkdownContent::ListItem {
