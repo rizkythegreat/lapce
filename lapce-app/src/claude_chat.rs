@@ -734,6 +734,11 @@ impl ClaudeChatData {
         self.session_id.set(Some(id.clone()));
         self.messages.set(im::Vector::new());
         self.show_sessions.set(false);
+        // Attach to the session now, not on the first message. Spawning makes
+        // no model request.
+        if let Err(e) = self.spawn() {
+            self.push(ChatRole::Error, format!("Failed to start claude: {e}"));
+        }
         let Some(dir) = self.sessions_dir() else {
             return;
         };
