@@ -279,6 +279,13 @@ pub struct ClaudeChatData {
     pub resume_warning: RwSignal<Option<ResumeWarning>>,
     /// How long the session being resumed sat idle, until its context is known
     resume_idle: Rc<Cell<Option<i64>>>,
+    /// Signed in account from `claude auth status`, None when signed out or
+    /// not checked yet
+    pub account: RwSignal<Option<String>>,
+    /// A running `claude auth login`, its stdin takes the pasted code
+    login: Rc<RefCell<Option<(Child, ChildStdin)>>>,
+    /// Login output chunks, None once its output closes
+    login_tx: Sender<Option<String>>,
     process: Rc<RefCell<Option<ChatProcess>>>,
     /// Bumped on every spawn and stop so events from an old process are ignored
     generation: Rc<Cell<u64>>,
@@ -343,6 +350,7 @@ impl KeyPressFocus for ClaudeChatData {
 impl ClaudeChatData {
     pub fn new(cx: Scope, editors: Editors, common: Rc<CommonData>) -> Self {
         let (tx, rx) = channel();
+        let (login_tx, login_rx) = channel();
         let chat = Self {
             scope: cx,
             editor: editors.make_local(cx, common.clone()),
@@ -366,6 +374,9 @@ impl ClaudeChatData {
             applied: cx.create_rw_signal(None),
             resume_warning: cx.create_rw_signal(None),
             resume_idle: Rc::new(Cell::new(None)),
+            account: cx.create_rw_signal(None),
+            login: Rc::new(RefCell::new(None)),
+            login_tx,
             process: Rc::new(RefCell::new(None)),
             generation: Rc::new(Cell::new(0)),
             next_id: Rc::new(Cell::new(0)),
@@ -385,6 +396,16 @@ impl ClaudeChatData {
             });
         });
 
+        let login = create_signal_from_channel(login_rx);
+        let chat2 = chat.clone();
+        cx.create_effect(move |_| {
+            login.with(|output| match output {
+                Some(Some(text)) => chat2.push(ChatRole::Assistant, text.clone()),
+                Some(None) => chat2.login_finished(),
+                None => {}
+            });
+        });
+
         chat
     }
 
@@ -396,6 +417,20 @@ impl ClaudeChatData {
             self.editor.reset();
             self.popup_index.set(0);
             self.new_session();
+            return;
+        }
+        // The code the login page shows, kept out of the chat
+        if let Some((_, stdin)) = self.login.borrow_mut().as_mut()
+            && !text.is_empty()
+        {
+            self.editor.reset();
+            let sent = writeln!(stdin, "{text}").and_then(|()| stdin.flush());
+            match sent {
+                Ok(()) => self.push(ChatRole::Assistant, "Code sent.".to_string()),
+                Err(e) => {
+                    self.push(ChatRole::Error, format!("Failed to send code: {e}"))
+                }
+            }
             return;
         }
         // Typed while a call waits for approval: deny it and tell Claude
@@ -658,6 +693,7 @@ impl ClaudeChatData {
         if self.commands_requested.replace(true) {
             return;
         }
+        self.refresh_account(false);
         let running = self.process.borrow().is_some();
         if !running && let Err(e) = self.spawn() {
             self.push(ChatRole::Error, format!("Failed to start claude: {e}"));
@@ -805,6 +841,105 @@ impl ClaudeChatData {
         });
     }
 
+    pub fn signing_in(&self) -> bool {
+        self.login.borrow().is_some()
+    }
+
+    /// Run `claude auth login`: it opens the browser and may ask for the
+    /// code the page shows, which the input then sends
+    pub fn login(&self) {
+        if self.signing_in() {
+            return;
+        }
+        self.stop();
+        let mut cmd = claude_command();
+        cmd.args(["auth", "login"]);
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                self.push(ChatRole::Error, format!("Failed to start login: {e}"));
+                return;
+            }
+        };
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        *self.login.borrow_mut() = Some((child, stdin));
+
+        let tx = self.login_tx.clone();
+        std::thread::spawn(move || forward_output(stderr, &tx));
+        let tx = self.login_tx.clone();
+        std::thread::spawn(move || {
+            forward_output(stdout, &tx);
+            let _ = tx.send(None);
+        });
+    }
+
+    pub fn cancel_login(&self) {
+        if let Some((mut child, _)) = self.login.borrow_mut().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.push(ChatRole::Assistant, "Sign-in cancelled.".to_string());
+        }
+    }
+
+    fn login_finished(&self) {
+        let Some((mut child, _)) = self.login.borrow_mut().take() else {
+            return;
+        };
+        let _ = child.wait();
+        self.refresh_account(true);
+    }
+
+    pub fn logout(&self) {
+        self.stop();
+        self.usage.set(None);
+        let chat = self.clone();
+        let send = create_ext_action(self.scope, move |result: Result<(), String>| {
+            if let Err(e) = result {
+                chat.push(ChatRole::Error, format!("Failed to log out: {e}"));
+            }
+            chat.refresh_account(true);
+        });
+        std::thread::spawn(move || {
+            let output = claude_command().args(["auth", "logout"]).output();
+            send(match output {
+                Ok(o) if o.status.success() => Ok(()),
+                Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                Err(e) => Err(e.to_string()),
+            });
+        });
+    }
+
+    /// Read the account from `claude auth status`. `announce` says the result
+    /// in the chat and restarts Claude Code under the new account.
+    fn refresh_account(&self, announce: bool) {
+        let chat = self.clone();
+        let send = create_ext_action(self.scope, move |account: Option<String>| {
+            chat.account.set(account.clone());
+            if !announce {
+                return;
+            }
+            let Some(account) = account else {
+                chat.push(ChatRole::Assistant, "Signed out.".to_string());
+                return;
+            };
+            chat.push(ChatRole::Assistant, format!("Signed in as {account}."));
+            // Usage, models and context of the new account
+            let running = chat.process.borrow().is_some();
+            if !running && let Err(e) = chat.spawn() {
+                chat.push(ChatRole::Error, format!("Failed to start claude: {e}"));
+            }
+        });
+        std::thread::spawn(move || {
+            let output = claude_command()
+                .args(["auth", "status", "--json"])
+                .output();
+            send(output.ok().and_then(|o| parse_account(&o.stdout)));
+        });
+    }
+
     /// `~/.claude/projects/<workspace path with non-alphanumerics as '-'>`
     fn sessions_dir(&self) -> Option<PathBuf> {
         let cwd = self
@@ -820,7 +955,7 @@ impl ClaudeChatData {
     }
 
     fn spawn(&self) -> std::io::Result<()> {
-        let mut cmd = Command::new("claude");
+        let mut cmd = claude_command();
         cmd.args([
             "-p",
             "--input-format",
@@ -857,8 +992,6 @@ impl ClaudeChatData {
             cmd.current_dir(path);
         }
         cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        #[cfg(target_os = "windows")]
-        std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x08000000);
 
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().unwrap();
@@ -1272,6 +1405,40 @@ fn parse_applied(applied: &Value) -> AppliedSettings {
     }
 }
 
+/// `claude` without a console window on Windows
+fn claude_command() -> Command {
+    #[allow(unused_mut)]
+    let mut cmd = Command::new("claude");
+    #[cfg(target_os = "windows")]
+    std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x08000000);
+    cmd
+}
+
+/// Send what a login process prints as it comes, its code prompt has no
+/// newline
+fn forward_output(mut output: impl Read, tx: &Sender<Option<String>>) {
+    let mut buf = [0; 4096];
+    while let Ok(n) = output.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        let text = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+        if !text.is_empty() && tx.send(Some(text)).is_err() {
+            break;
+        }
+    }
+}
+
+/// The email, or the auth method when there is none, None when signed out
+fn parse_account(status: &[u8]) -> Option<String> {
+    let status: Value = serde_json::from_slice(status).ok()?;
+    if status["loggedIn"] != true {
+        return None;
+    }
+    let account = status["email"].as_str().or(status["authMethod"].as_str());
+    Some(account.unwrap_or("Claude").to_string())
+}
+
 /// From `get_context_usage`, which counts the whole history without a model
 /// request
 fn parse_context(response: &Value) -> Option<ContextUsage> {
@@ -1619,6 +1786,17 @@ mod tests {
         assert!(resume_warning(30 * 60, 427_805).is_none());
         assert!(resume_warning(2 * hour, 20_000).is_none());
         assert!(resume_warning(RESUME_IDLE_SECS, RESUME_TOKENS).is_some());
+    }
+
+    #[test]
+    fn account_from_auth_status() {
+        let account = |status: Value| parse_account(status.to_string().as_bytes());
+        let email = json!({"loggedIn": true, "email": "a@b"});
+        assert_eq!(account(email).as_deref(), Some("a@b"));
+        let key = json!({"loggedIn": true, "authMethod": "api_key"});
+        assert_eq!(account(key).as_deref(), Some("api_key"));
+        assert_eq!(account(json!({"loggedIn": false})), None);
+        assert_eq!(parse_account(b"not json"), None);
     }
 
     #[test]

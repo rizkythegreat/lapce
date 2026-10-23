@@ -213,7 +213,9 @@ fn header(
     let show_sessions = chat.show_sessions;
     let usage = chat.usage;
     let messages = chat.messages;
+    let account = chat.account;
     let chat2 = chat.clone();
+    let account_chat = chat.clone();
     // The first prompt names the conversation, like the session list does
     let title = create_memo(move |_| {
         messages.with(|messages| {
@@ -276,6 +278,14 @@ fn header(
         }),
         empty().style(|s| s.flex_grow(1.0f32)),
         usage_view(usage, config),
+        clickable_icon(
+            || LapceIcons::MENU,
+            move || show_account_menu(&account_chat),
+            || false,
+            || false,
+            move || account.get().unwrap_or_else(|| "Account".to_string()),
+            config,
+        ),
         clickable_icon(
             || LapceIcons::ADD,
             move || chat.new_session(),
@@ -618,6 +628,33 @@ fn show_choice_menu<T: Clone + PartialEq + 'static>(
         let item = MenuItem::new(format!("{mark}{name}"))
             .action(move || pick(choice.clone()));
         menu = menu.entry(item);
+    }
+    show_context_menu(menu, None);
+}
+
+/// The account, then sign in, switch or sign out. Signing in runs in the
+/// chat: its output shows there and the input takes the code it asks for.
+fn show_account_menu(chat: &ClaudeChatData) {
+    let account = chat.account.get_untracked();
+    let name = account.clone().unwrap_or_else(|| "Not signed in".to_string());
+    let mut menu = Menu::new("").entry(MenuItem::new(name).enabled(false));
+    if chat.signing_in() {
+        let chat = chat.clone();
+        let cancel = move || chat.cancel_login();
+        menu = menu.entry(MenuItem::new("Cancel sign-in").action(cancel));
+    } else {
+        let login = chat.clone();
+        let text = if account.is_some() {
+            "Switch account"
+        } else {
+            "Log in"
+        };
+        menu = menu.entry(MenuItem::new(text).action(move || login.login()));
+        if account.is_some() {
+            let chat = chat.clone();
+            let logout = move || chat.logout();
+            menu = menu.entry(MenuItem::new("Log out").action(logout));
+        }
     }
     show_context_menu(menu, None);
 }
