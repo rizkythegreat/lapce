@@ -15,12 +15,14 @@ use floem::{
     ext_event::{create_ext_action, create_signal_from_channel},
     keyboard::Modifiers,
     reactive::{RwSignal, Scope, SignalGet, SignalUpdate, SignalWith},
+    views::editor::text::SystemClipboard,
 };
 use lapce_core::{
     buffer::rope_text::RopeText,
     command::{EditCommand, FocusCommand},
     directory::Directory,
     mode::Mode,
+    register::Clipboard,
     selection::Selection,
 };
 use lapce_rpc::proxy::ProxyResponse;
@@ -263,6 +265,9 @@ pub struct ClaudeChatData {
     commands_requested: Rc<Cell<bool>>,
     /// Claude Code's guess at the next prompt, shown in the empty input
     pub suggestion: RwSignal<Option<String>>,
+    /// Long pastes, shown in the input as `[Pasted text #n ...]` and
+    /// expanded on send. Paste `#n` is at index n - 1.
+    pastes: Rc<RefCell<Vec<String>>>,
     /// A `PERMISSION_MODES` value, "default" asks. Back to it on every
     /// launch.
     pub permission_mode: RwSignal<&'static str>,
@@ -339,6 +344,9 @@ impl KeyPressFocus for ClaudeChatData {
                 self.send();
                 CommandExecuted::Yes
             }
+            CommandKind::Edit(EditCommand::ClipboardPaste) if self.paste_long() => {
+                CommandExecuted::Yes
+            }
             CommandKind::Edit(_)
             | CommandKind::Move(_)
             | CommandKind::MultiSelection(_) => {
@@ -372,6 +380,7 @@ impl ClaudeChatData {
             popup_index: cx.create_rw_signal(0),
             commands_requested: Rc::new(Cell::new(false)),
             suggestion: cx.create_rw_signal(None),
+            pastes: Rc::new(RefCell::new(Vec::new())),
             permission_mode: cx.create_rw_signal("default"),
             models: cx.create_rw_signal(Vec::new()),
             model: cx.create_rw_signal(None),
@@ -421,9 +430,12 @@ impl ClaudeChatData {
     pub fn send(&self) {
         let text = self.editor.doc().buffer.with_untracked(|b| b.to_string());
         let text = text.trim();
+        // What Claude gets, the chat keeps the short placeholders
+        let full = expand_pastes(text, &self.pastes.borrow());
         // Headless Claude Code has no /clear, handle it here, even mid-turn
         if text == "/clear" {
             self.editor.reset();
+            self.pastes.borrow_mut().clear();
             self.popup_index.set(0);
             self.new_session();
             return;
@@ -433,7 +445,7 @@ impl ClaudeChatData {
             && !text.is_empty()
         {
             self.editor.reset();
-            let sent = writeln!(stdin, "{text}").and_then(|()| stdin.flush());
+            let sent = writeln!(stdin, "{full}").and_then(|()| stdin.flush());
             match sent {
                 Ok(()) => self.push(ChatRole::Assistant, "Code sent.".to_string()),
                 Err(e) => {
@@ -453,7 +465,7 @@ impl ClaudeChatData {
             self.respond_permission(
                 &request.request_id,
                 PermissionDecision::Deny,
-                Some(text),
+                Some(&full),
             );
             return;
         }
@@ -492,7 +504,7 @@ impl ClaudeChatData {
 
         let line = json!({
             "type": "user",
-            "message": { "role": "user", "content": text },
+            "message": { "role": "user", "content": full },
         });
         match self.write_line(&line) {
             Ok(()) => self.busy.set(true),
@@ -501,6 +513,21 @@ impl ClaudeChatData {
                 self.push(ChatRole::Error, format!("Failed to send: {e}"));
             }
         }
+    }
+
+    /// Long clipboard text goes in as a placeholder, false leaves short
+    /// text to the editor's own paste
+    fn paste_long(&self) -> bool {
+        let Some(text) = SystemClipboard::new().get_string() else {
+            return false;
+        };
+        if text.lines().count() <= PASTE_MAX_LINES && text.len() <= PASTE_MAX_LEN {
+            return false;
+        }
+        let placeholder = paste_placeholder(self.pastes.borrow().len() + 1, &text);
+        self.pastes.borrow_mut().push(text);
+        self.editor.receive_char(&placeholder);
+        true
     }
 
     /// Kill the running turn. The next message resumes the same session.
@@ -1514,6 +1541,24 @@ fn parse_commands(commands: &Value) -> Option<Vec<SlashCommand>> {
     )
 }
 
+/// Pastes longer than this become a placeholder in the input
+const PASTE_MAX_LINES: usize = 10;
+const PASTE_MAX_LEN: usize = 1000;
+
+/// Paste `n` (1-based) as shown in the input, like the CLI shows it
+fn paste_placeholder(n: usize, text: &str) -> String {
+    format!("[Pasted text #{n} +{} lines]", text.lines().count())
+}
+
+/// The input with paste placeholders replaced by what was pasted
+fn expand_pastes(input: &str, pastes: &[String]) -> String {
+    let mut input = input.to_string();
+    for (i, text) in pastes.iter().enumerate() {
+        input = input.replace(&paste_placeholder(i + 1, text), text);
+    }
+    input
+}
+
 /// Commands for the popup while the input is `/` plus a partial name.
 /// Name prefix matches come first, then other substring matches.
 fn filter_commands(commands: &[SlashCommand], input: &str) -> Vec<SlashCommand> {
@@ -1772,8 +1817,21 @@ mod tests {
         parse_usage, path_mention, permission_response, project_dir_name,
         parse_applied, parse_models, read_history, replace_last_token,
         request_tokens, result_summary, result_text, session_title, tool_call,
-        tool_summary,
+        tool_summary, expand_pastes, paste_placeholder,
     };
+
+    #[test]
+    fn pastes_expand_on_send() {
+        let pastes = vec!["a\nb".to_string(), "c".to_string()];
+        let input = format!(
+            "fix {} and {}",
+            paste_placeholder(1, &pastes[0]),
+            paste_placeholder(2, &pastes[1])
+        );
+        assert!(input.contains("[Pasted text #1 +2 lines]"));
+        assert_eq!(expand_pastes(&input, &pastes), "fix a\nb and c");
+        assert_eq!(expand_pastes("no paste", &pastes), "no paste");
+    }
 
     #[test]
     fn request_tokens_counts_cache() {
