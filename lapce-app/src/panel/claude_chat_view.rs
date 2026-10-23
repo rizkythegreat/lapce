@@ -805,7 +805,7 @@ fn permission_view(
         |request| request.request_id.clone(),
         move |request| permission_card(request, chat.clone(), config),
     )
-    .style(|s| s.width_full())
+    .style(|s| s.width_full().min_width(0.0))
 }
 
 /// Claude Code's resume prompt: an idle session lost its prompt cache, so the
@@ -897,7 +897,8 @@ fn permission_card(
             let color = config.color(LapceColor::EDITOR_FOREGROUND);
             plain_text(&detail, color, &config)
         })
-        .style(|s| s.width_full().margin_vert(6.0)),
+        // Lets a long command wrap instead of widening the card
+        .style(|s| s.width_full().min_width(0.0).margin_vert(6.0)),
         stack_from_iter(options).style(|s| s.flex_col().width_full().gap(4.0)),
         label(|| "Or type below to tell Claude what to do instead").style(
             move |s| {
@@ -909,6 +910,7 @@ fn permission_card(
     .style(move |s| {
         let config = config.get();
         s.flex_col()
+            .min_width(0.0)
             .margin_horiz(10.0)
             .margin_bottom(6.0)
             .padding(10.0)
