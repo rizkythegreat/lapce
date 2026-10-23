@@ -22,7 +22,7 @@ use floem::{
     reactive::{
         ReadSignal, RwSignal, Scope, SignalGet, SignalUpdate, SignalWith, batch,
     },
-    text::{Attrs, AttrsList, FamilyOwned, TextLayout},
+    text::{Attrs, AttrsList, FamilyOwned, TextLayout, Wrap},
     views::editor::{
         CursorInfo, Editor, EditorStyle,
         actions::CommonAction,
@@ -76,7 +76,7 @@ use smallvec::SmallVec;
 
 use crate::{
     command::{CommandKind, LapceCommand},
-    config::{LapceConfig, color::LapceColor},
+    config::{LapceConfig, color::LapceColor, editor::WrapStyle},
     editor::{EditorData, compute_screen_lines, gutter::FoldingRanges},
     find::{Find, FindProgress, FindResult},
     history::DocumentHistory,
@@ -1488,6 +1488,59 @@ impl Doc {
         })
     }
 
+    /// `blame` cut to the room left after `line` (with `phantoms`) on its last
+    /// wrapped row, so the blame never wraps onto a row of its own. None when
+    /// too little room is left
+    fn fit_blame(
+        &self,
+        edid: EditorId,
+        line: usize,
+        phantoms: &SmallVec<[PhantomText; 6]>,
+        blame: String,
+        config: &LapceConfig,
+    ) -> Option<String> {
+        let width = match config.editor.wrap_style {
+            WrapStyle::None => return Some(blame),
+            WrapStyle::EditorWidth => {
+                self.editor_data(edid)?.viewport().get_untracked().width() as f32
+            }
+            WrapStyle::WrapWidth => config.editor.wrap_width as f32,
+        };
+        let family: Vec<FamilyOwned> =
+            FamilyOwned::parse_list(&config.editor.font_family).collect();
+        // Width of the last row `text` lays out to
+        let last_row_width = |text: &str, font_size: usize, wrap: bool| {
+            let attrs = Attrs::new().family(&family).font_size(font_size as f32);
+            let mut layout = TextLayout::new();
+            layout.set_tab_width(config.editor.tab_width);
+            layout.set_text(text, AttrsList::new(attrs), None);
+            if wrap {
+                layout.set_wrap(Wrap::WordOrGlyph);
+                layout.set_size(width, f32::MAX);
+            }
+            layout.layout_runs().last().map_or(0.0, |run| run.line_w)
+        };
+
+        // Newlines become spaces like the editor's own layout, phantom
+        // columns count them
+        let content = self.rope_text().line_content(line).replace(['\r', '\n'], " ");
+        let content = PhantomTextLine {
+            text: phantoms.clone(),
+        }
+        .combine_with_text(&content);
+        let room = width - last_row_width(&content, config.editor.font_size(), true);
+        let blame_width =
+            last_row_width(&blame, config.editor.inlay_hint_font_size(), false);
+        if blame_width <= room {
+            return Some(blame);
+        }
+        // ponytail: assumes even glyph widths, fine for monospace editor fonts
+        let fit = (blame.chars().count() as f32 * room / blame_width) as usize;
+        // One char of slack for rounding
+        let fit = fit.saturating_sub(1);
+        (fit >= BLAME_MIN_CHARS).then(|| truncate_chars(&blame, fit))
+    }
+
     /// Whether `line` shows the inline blame right now
     pub fn shows_blame(&self, line: usize) -> bool {
         self.common.config.get_untracked().editor.enable_inline_blame
@@ -1869,7 +1922,7 @@ impl Document for Doc {
 impl DocumentPhantom for Doc {
     fn phantom_text(
         &self,
-        _: EditorId,
+        edid: EditorId,
         _: &EditorStyle,
         line: usize,
     ) -> PhantomTextLine {
@@ -2035,6 +2088,7 @@ impl DocumentPhantom for Doc {
         if config.editor.enable_inline_blame
             && self.blame_line.get_untracked() == Some(line)
             && let Some(blame) = self.blame_text(line)
+            && let Some(blame) = self.fit_blame(edid, line, &text, blame, config)
         {
             text.push(PhantomText {
                 kind: PhantomTextKind::Diagnostic,
@@ -2504,6 +2558,9 @@ fn extra_styles_for_range(
 
 /// Inline blame summaries stop here, the hover shows the rest
 const BLAME_SUMMARY_CHARS: usize = 50;
+
+/// Below this many characters a cut inline blame is hidden instead
+const BLAME_MIN_CHARS: usize = 20;
 
 /// `text` cut to `max` characters, the last one an ellipsis when cut
 fn truncate_chars(text: &str, max: usize) -> String {
