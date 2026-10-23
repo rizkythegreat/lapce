@@ -580,7 +580,7 @@ impl View for TextInput {
                 let text_layout = text_layout.as_ref().unwrap();
 
                 let offset = self.cursor().get_untracked().offset();
-                let cursor_point = text_layout.hit_position(offset).point;
+                let cursor_point = caret_line(text_layout, offset).p1;
                 if cursor_point != self.cursor_pos {
                     self.cursor_pos = cursor_point;
                     self.ensure_cursor_visible();
@@ -635,21 +635,10 @@ impl View for TextInput {
             .with_origin(Point::new(location.x as f64, location.y as f64));
         let offset = self.cursor().with_untracked(|c| c.offset());
         let cursor_line = self.text_layout.with_untracked(|text_layout| {
-            let hit_position = text_layout.as_ref().unwrap().hit_position(offset);
-            let point = Point::new(location.x as f64, location.y as f64)
+            let caret = caret_line(text_layout.as_ref().unwrap(), offset);
+            let shift = Vec2::new(location.x as f64, location.y as f64)
                 - self.text_viewport.origin().to_vec2();
-            let cursor_point = hit_position.point + point.to_vec2();
-
-            Line::new(
-                Point::new(
-                    cursor_point.x,
-                    cursor_point.y - hit_position.glyph_ascent,
-                ),
-                Point::new(
-                    cursor_point.x,
-                    cursor_point.y + hit_position.glyph_descent,
-                ),
-            )
+            Line::new(caret.p0 + shift, caret.p1 + shift)
         });
         self.cursor_line.set(cursor_line);
 
@@ -745,24 +734,11 @@ impl View for TextInput {
             }
 
             if let Some((start, end)) = self.preedit_range {
-                let start_position = text_layout.hit_position(start);
-                let start_point = start_position.point
-                    + self.layout_rect.origin().to_vec2()
+                let shift = self.layout_rect.origin().to_vec2()
                     - self.text_viewport.origin().to_vec2();
-                let end_position = text_layout.hit_position(end);
-                let end_point = end_position.point
-                    + self.layout_rect.origin().to_vec2()
-                    - self.text_viewport.origin().to_vec2();
-
                 let line = Line::new(
-                    Point::new(
-                        start_point.x,
-                        start_point.y + start_position.glyph_descent,
-                    ),
-                    Point::new(
-                        end_point.x,
-                        end_point.y + end_position.glyph_descent,
-                    ),
+                    caret_line(text_layout, start).p1 + shift,
+                    caret_line(text_layout, end).p1 + shift,
                 );
                 cx.stroke(
                     &line,
@@ -776,21 +752,10 @@ impl View for TextInput {
             {
                 cx.clip(&self.text_rect.inflate(2.0, 2.0));
 
-                let hit_position = text_layout.hit_position(self.offset);
-                let cursor_point = hit_position.point
-                    + self.layout_rect.origin().to_vec2()
+                let caret = caret_line(text_layout, self.offset);
+                let shift = self.layout_rect.origin().to_vec2()
                     - self.text_viewport.origin().to_vec2();
-
-                let line = Line::new(
-                    Point::new(
-                        cursor_point.x,
-                        cursor_point.y - hit_position.glyph_ascent,
-                    ),
-                    Point::new(
-                        cursor_point.x,
-                        cursor_point.y + hit_position.glyph_descent,
-                    ),
-                );
+                let line = Line::new(caret.p0 + shift, caret.p1 + shift);
 
                 cx.stroke(
                     &line,
@@ -802,6 +767,37 @@ impl View for TextInput {
             cx.restore();
         });
     }
+}
+
+/// Caret at byte `offset`, from the top to the bottom of its line.
+/// `TextLayout::hit_position` miscounts offsets after an empty line, which
+/// put the caret on the wrong line of multi-line input.
+fn caret_line(text_layout: &TextLayout, offset: usize) -> Line {
+    let ranges = text_layout.lines_range();
+    let line = ranges
+        .iter()
+        .position(|range| offset <= range.end)
+        .unwrap_or(ranges.len().saturating_sub(1));
+    let col = offset.saturating_sub(ranges.get(line).map_or(0, |range| range.start));
+    let mut caret = None;
+    // A wrapped line has several runs, the caret is in the first glyph
+    // ending past it, or else after the line's last run
+    for run in text_layout.layout_runs().filter(|run| run.line_i == line) {
+        let glyph = run.glyphs.iter().find(|glyph| col < glyph.end);
+        let x = match glyph {
+            Some(glyph) => glyph.x,
+            None => run.glyphs.last().map_or(0.0, |glyph| glyph.x + glyph.w),
+        };
+        let top = run.line_top as f64;
+        caret = Some(Line::new(
+            Point::new(x as f64, top),
+            Point::new(x as f64, top + run.line_height as f64),
+        ));
+        if glyph.is_some() {
+            break;
+        }
+    }
+    caret.unwrap_or(Line::new(Point::ZERO, Point::ZERO))
 }
 
 /// Highlight of the `min..max` byte range, a rect per line it covers
