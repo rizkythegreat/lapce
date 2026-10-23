@@ -28,7 +28,9 @@ use floem::{
         view::{
             DiffSection, DiffSectionKind, LineInfo, ScreenLines, ScreenLinesBase,
         },
-        visual_line::{ConfigId, Lines, TextLayoutProvider, VLine, VLineInfo},
+        visual_line::{
+            ConfigId, Lines, RVLine, TextLayoutProvider, VLine, VLineInfo,
+        },
     },
 };
 use itertools::Itertools;
@@ -3859,11 +3861,12 @@ pub(crate) fn compute_screen_lines(
                                 if Some(skip.start) == line.checked_sub(start) {
                                     y_idx += 1;
 
-                                    // restart iterator after the skip
-                                    let start_rvline = lines.rvline_of_line(
-                                        &text_prov,
-                                        start + skip.end,
-                                    );
+                                    // restart iterator after the skip. A buffer line always
+                                    // starts at line_index 0; resolving it through an offset
+                                    // can land back inside the skip with wrapping on and
+                                    // restart forever.
+                                    let start_rvline =
+                                        RVLine::new(start + skip.end, 0);
 
                                     iter = lines
                                         .iter_rvlines_init(
