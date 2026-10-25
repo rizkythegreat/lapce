@@ -320,3 +320,7 @@ when = "terminal_focus"
 key = "ctrl+alt+left"
 command = "focus_previous_terminal_pane"
 when = "terminal_focus"
+
+[[keymaps]]
+key = "alt+ctrl+k"
+command = "ask_claude"

@@ -315,3 +315,7 @@ when = "terminal_focus"
 key = "alt+meta+left"
 command = "focus_previous_terminal_pane"
 when = "terminal_focus"
+
+[[keymaps]]
+key = "alt+meta+k"
+command = "ask_claude"

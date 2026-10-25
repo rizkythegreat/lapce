@@ -66,7 +66,7 @@ use crate::{
     debug::{DapData, LapceBreakpoint, RunDebugMode, RunDebugProcess},
     doc::DocContent,
     editor::{
-        InlineFindDirection,
+        EditorData, InlineFindDirection,
         location::{EditorLocation, EditorPosition},
     },
     editor_tab::EditorTabChild,
@@ -1562,6 +1562,39 @@ impl WindowTabData {
                     editor_data.find_reference(self.clone());
                 }
             }
+            AskClaude => {
+                if let Some((editor, path)) = self.active_file_editor() {
+                    self.show_panel(PanelKind::ClaudeChat);
+                    self.claude_chat.ask_about(&path, editor.selected_lines());
+                }
+            }
+            FixWithClaude => {
+                if let Some((editor, path)) = self.active_file_editor() {
+                    let doc = editor.doc();
+                    let offset = editor.cursor().with_untracked(|c| c.offset());
+                    let line =
+                        doc.buffer.with_untracked(|b| b.line_of_offset(offset));
+                    let line = line as u32;
+                    let all = doc.diagnostics().diagnostics.get_untracked();
+                    // The problems on the cursor line, else the whole file's
+                    let at_cursor: Vec<_> = all
+                        .iter()
+                        .filter(|d| {
+                            (d.range.start.line..=d.range.end.line).contains(&line)
+                        })
+                        .cloned()
+                        .collect();
+                    let diagnostics = if at_cursor.is_empty() {
+                        all.into_iter().collect()
+                    } else {
+                        at_cursor
+                    };
+                    if !diagnostics.is_empty() {
+                        self.show_panel(PanelKind::ClaudeChat);
+                        self.claude_chat.fix_diagnostics(&path, &diagnostics);
+                    }
+                }
+            }
             GoToImplementation => {
                 if let Some(editor_data) =
                     self.main_split.active_editor.get_untracked()
@@ -2711,6 +2744,13 @@ impl WindowTabData {
     }
 
     /// Toggle a specific kind of panel.
+    /// The active editor with the path of its file
+    fn active_file_editor(&self) -> Option<(EditorData, PathBuf)> {
+        let editor = self.main_split.active_editor.get_untracked()?;
+        let path = editor.doc().content.with_untracked(|c| c.path().cloned())?;
+        Some((editor, path))
+    }
+
     fn toggle_panel_focus(&self, kind: PanelKind) {
         let should_hide = match kind {
             PanelKind::Plugin

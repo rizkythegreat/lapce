@@ -2614,7 +2614,43 @@ impl EditorData {
     #[instrument]
     pub fn word_at_cursor(&self) -> String {
         let doc = self.doc();
-        let region = self.cursor().with_untracked(|c| match &c.mode {
+        let region = self.selection_region();
+
+        if region.is_caret() {
+            doc.buffer.with_untracked(|buffer| {
+                let (start, end) = buffer.select_word(region.start);
+                buffer.slice_to_cow(start..end).to_string()
+            })
+        } else {
+            doc.buffer.with_untracked(|buffer| {
+                buffer.slice_to_cow(region.min()..region.max()).to_string()
+            })
+        }
+    }
+
+    /// 1-based first and last line of the selection and its text, None
+    /// without a selection
+    pub fn selected_lines(&self) -> Option<(usize, usize, String)> {
+        let region = self.selection_region();
+        if region.is_caret() {
+            return None;
+        }
+        let (min, max) = (region.min(), region.max());
+        self.doc().buffer.with_untracked(|buffer| {
+            Some((
+                buffer.line_of_offset(min) + 1,
+                // The last selected character, so a selection ending at a
+                // line start doesn't count that line
+                buffer.line_of_offset(max - 1) + 1,
+                buffer.slice_to_cow(min..max).to_string(),
+            ))
+        })
+    }
+
+    /// The last selection, a caret at the cursor when nothing is selected
+    fn selection_region(&self) -> SelRegion {
+        let doc = self.doc();
+        self.cursor().with_untracked(|c| match &c.mode {
             lapce_core::cursor::CursorMode::Normal(offset) => {
                 lapce_core::selection::SelRegion::caret(*offset)
             }
@@ -2632,18 +2668,7 @@ impl EditorData {
             lapce_core::cursor::CursorMode::Insert(selection) => {
                 *selection.last_inserted().unwrap()
             }
-        });
-
-        if region.is_caret() {
-            doc.buffer.with_untracked(|buffer| {
-                let (start, end) = buffer.select_word(region.start);
-                buffer.slice_to_cow(start..end).to_string()
-            })
-        } else {
-            doc.buffer.with_untracked(|buffer| {
-                buffer.slice_to_cow(region.min()..region.max()).to_string()
-            })
-        }
+        })
     }
 
     #[instrument]
@@ -2963,6 +2988,11 @@ impl EditorData {
                     Some(CommandKind::Focus(FocusCommand::Rename)),
                     Some(CommandKind::Workbench(
                         LapceWorkbenchCommand::RunInTerminal,
+                    )),
+                    None,
+                    Some(CommandKind::Workbench(LapceWorkbenchCommand::AskClaude)),
+                    Some(CommandKind::Workbench(
+                        LapceWorkbenchCommand::FixWithClaude,
                     )),
                     None,
                     Some(CommandKind::Workbench(

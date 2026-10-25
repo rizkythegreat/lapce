@@ -191,6 +191,14 @@ pub enum LapceWorkbenchCommand {
     #[strum(message = "Find References")]
     FindReferences,
 
+    #[strum(serialize = "ask_claude")]
+    #[strum(message = "Ask Claude About Selection")]
+    AskClaude,
+
+    #[strum(serialize = "fix_with_claude")]
+    #[strum(message = "Fix with Claude")]
+    FixWithClaude,
+
     #[strum(serialize = "go_to_implementation")]
     #[strum(message = "Go to Implementation")]
     GoToImplementation,

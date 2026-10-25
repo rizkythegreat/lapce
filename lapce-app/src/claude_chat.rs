@@ -27,6 +27,7 @@ use lapce_core::{
 };
 use lapce_rpc::proxy::ProxyResponse;
 use lapce_xi_rope::Rope;
+use lsp_types::{Diagnostic, DiagnosticSeverity};
 use serde_json::{Value, json};
 
 use crate::{
@@ -757,13 +758,40 @@ impl ClaudeChatData {
     /// Append an `@` mention for a file dropped on the panel
     pub fn mention_path(&self, path: &Path) {
         let mention = path_mention(path, self.common.workspace.path.as_deref());
+        self.append_input(&mention);
+    }
+
+    /// Mention the file with the selected lines, the code going in as a
+    /// collapsed paste. Without a selection only the file is mentioned.
+    pub fn ask_about(&self, path: &Path, selection: Option<(usize, usize, String)>) {
+        let Some((start, end, code)) = selection else {
+            self.mention_path(path);
+            return;
+        };
+        let mention = path_mention(path, self.common.workspace.path.as_deref());
+        let code = format!("```\n{code}\n```");
+        let placeholder = paste_placeholder(self.pastes.borrow().len() + 1, &code);
+        self.pastes.borrow_mut().push(code);
+        let lines = line_range(start, end);
+        self.append_input(&format!("{mention} {lines} {placeholder}"));
+    }
+
+    /// Ask Claude to fix the diagnostics of a file, left in the input to
+    /// add to or send
+    pub fn fix_diagnostics(&self, path: &Path, diagnostics: &[Diagnostic]) {
+        let mention = path_mention(path, self.common.workspace.path.as_deref());
+        self.append_input(&diagnostics_prompt(&mention, diagnostics));
+    }
+
+    /// Add to the end of the input, a space apart from what's there
+    fn append_input(&self, text: &str) {
         let input = self.editor.doc().buffer.with_untracked(|b| b.to_string());
         let sep = if input.is_empty() || input.ends_with(char::is_whitespace) {
             ""
         } else {
             " "
         };
-        self.set_input(format!("{input}{sep}{mention} "));
+        self.set_input(format!("{input}{sep}{text} "));
     }
 
     /// Replace the input and put the cursor at its end
@@ -1604,6 +1632,42 @@ fn path_mention(path: &Path, workspace: Option<&Path>) -> String {
     }
 }
 
+/// `line 3` or `lines 3-7`
+fn line_range(start: usize, end: usize) -> String {
+    if start == end {
+        format!("line {start}")
+    } else {
+        format!("lines {start}-{end}")
+    }
+}
+
+/// A fix request listing each diagnostic with its 1-based line
+fn diagnostics_prompt(mention: &str, diagnostics: &[Diagnostic]) -> String {
+    let mut prompt = format!("Fix these problems in {mention}:");
+    for d in diagnostics {
+        let severity = match d.severity {
+            Some(DiagnosticSeverity::ERROR) => "error",
+            Some(DiagnosticSeverity::WARNING) => "warning",
+            Some(DiagnosticSeverity::INFORMATION) => "info",
+            Some(DiagnosticSeverity::HINT) => "hint",
+            _ => "problem",
+        };
+        let range = line_range(
+            d.range.start.line as usize + 1,
+            d.range.end.line as usize + 1,
+        );
+        let source = d
+            .source
+            .as_ref()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        // Keep multi-line messages under their bullet
+        let message = d.message.trim().replace('\n', "\n  ");
+        prompt.push_str(&format!("\n- {range}, {severity}{source}: {message}"));
+    }
+    prompt
+}
+
 /// The `@` mention being typed at the end of the input, without the `@`
 pub fn mention_query(input: &str) -> Option<&str> {
     last_token(input).strip_prefix('@')
@@ -1829,7 +1893,8 @@ mod tests {
         parse_usage, path_mention, permission_response, project_dir_name,
         parse_applied, parse_models, read_history, replace_last_token,
         request_tokens, result_summary, result_text, session_title, tool_call,
-        tool_summary, expand_pastes, paste_placeholder,
+        tool_summary, expand_pastes, paste_placeholder, diagnostics_prompt,
+        line_range,
     };
 
     #[test]
@@ -2119,5 +2184,31 @@ mod tests {
         assert_eq!(mention("/ws/src/main.rs"), "@src/main.rs");
         assert_eq!(mention("/other/a.rs"), "@/other/a.rs");
         assert_eq!(mention("/ws/my notes.md"), "@\"my notes.md\"");
+    }
+
+    #[test]
+    fn diagnostics_fix_prompt() {
+        use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
+        assert_eq!(line_range(3, 3), "line 3");
+        assert_eq!(line_range(3, 7), "lines 3-7");
+        let at = |line| Position { line, character: 0 };
+        let error = Diagnostic {
+            range: Range { start: at(11), end: at(11) },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some("rustc".to_string()),
+            message: "mismatched types\nexpected `u8`".to_string(),
+            ..Default::default()
+        };
+        let no_severity = Diagnostic {
+            range: Range { start: at(0), end: at(2) },
+            message: "unused".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            diagnostics_prompt("@src/a.rs", &[error, no_severity]),
+            "Fix these problems in @src/a.rs:\n\
+             - line 12, error (rustc): mismatched types\n  expected `u8`\n\
+             - lines 1-3, problem: unused"
+        );
     }
 }
