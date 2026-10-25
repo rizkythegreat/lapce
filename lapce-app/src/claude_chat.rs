@@ -1655,7 +1655,8 @@ fn system_notification(body: &str) {
             "-e",
             "on run argv",
             "-e",
-            "display notification (item 1 of argv) with title \"Claude\"",
+            "display notification (item 1 of argv) with title \"Claude\" \
+             sound name \"Glass\"",
             "-e",
             "end run",
             "--",
