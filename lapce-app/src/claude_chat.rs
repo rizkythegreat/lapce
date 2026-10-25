@@ -1650,23 +1650,11 @@ fn path_mention(path: &Path, workspace: Option<&Path>) -> String {
 fn system_notification(body: &str) {
     let body: String = body.chars().take(200).collect();
     #[cfg(target_os = "macos")]
-    if let Some(bundle) = objc2_foundation::NSBundle::mainBundle()
+    if objc2_foundation::NSBundle::mainBundle()
         .bundleIdentifier()
-        .map(|id| id.to_string())
+        .is_some()
     {
-        // Off the UI thread, delivery sleeps briefly
-        std::thread::spawn(move || {
-            // Without it the notification comes from Finder. Only the first
-            // call per process sets it, later ones report it's set.
-            let _ = mac_notification_sys::set_application(&bundle);
-            let _ = mac_notification_sys::Notification::new()
-                .title("Claude")
-                .message(&body)
-                .sound("Glass")
-                // Else it waits for a click on a run loop that never ends
-                .asynchronous(true)
-                .send();
-        });
+        mac_notification(&body);
         return;
     }
     // Run from outside an app bundle, e.g. `cargo run`
@@ -1696,6 +1684,21 @@ fn system_notification(body: &str) {
     std::thread::spawn(move || {
         let _ = cmd.status();
     });
+}
+
+/// Delivered by the app itself, so it shows Lapce's name and icon
+// ponytail: NSUserNotification is deprecated, move to UserNotifications
+// when it stops delivering. That one needs a signed app and a permission.
+#[cfg(target_os = "macos")]
+#[allow(deprecated)]
+fn mac_notification(body: &str) {
+    use objc2_foundation::{NSString, NSUserNotification, NSUserNotificationCenter};
+    let notification = NSUserNotification::new();
+    notification.setTitle(Some(&NSString::from_str("Claude")));
+    notification.setInformativeText(Some(&NSString::from_str(body)));
+    notification.setSoundName(Some(&NSString::from_str("Glass")));
+    NSUserNotificationCenter::defaultUserNotificationCenter()
+        .deliverNotification(&notification);
 }
 
 /// `line 3` or `lines 3-7`
