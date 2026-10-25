@@ -64,8 +64,11 @@ zip              = { version = "0.6.6", default-features = false, features = ["d
 percent-encoding = { version = "2.3.1" }
 
 [target.'cfg(target_os="macos")'.dependencies]
-fs_extra = "1.2.0"
-dmg      = "0.1.1"
+fs_extra             = "1.2.0"
+dmg                  = "0.1.1"
+# 0.6.10+ needs cc 1.2, held back to keep the locked cc
+mac-notification-sys = "=0.6.9"
+objc2-foundation     = { version = "0.3", features = ["NSBundle", "NSString"] }
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 workspace = true

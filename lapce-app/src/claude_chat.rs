@@ -1644,10 +1644,32 @@ fn path_mention(path: &Path, workspace: Option<&Path>) -> String {
     }
 }
 
-/// Shown by the OS with the body passed as an argument, so it needs no
-/// escaping. Quietly does nothing where the command is missing.
+/// Shown by the OS as coming from Lapce when it runs as an app bundle,
+/// else through a command with the body passed as an argument, so it needs
+/// no escaping. Quietly does nothing where the command is missing.
 fn system_notification(body: &str) {
     let body: String = body.chars().take(200).collect();
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = objc2_foundation::NSBundle::mainBundle()
+        .bundleIdentifier()
+        .map(|id| id.to_string())
+    {
+        // Off the UI thread, delivery sleeps briefly
+        std::thread::spawn(move || {
+            // Without it the notification comes from Finder. Only the first
+            // call per process sets it, later ones report it's set.
+            let _ = mac_notification_sys::set_application(&bundle);
+            let _ = mac_notification_sys::Notification::new()
+                .title("Claude")
+                .message(&body)
+                .sound("Glass")
+                // Else it waits for a click on a run loop that never ends
+                .asynchronous(true)
+                .send();
+        });
+        return;
+    }
+    // Run from outside an app bundle, e.g. `cargo run`
     #[cfg(target_os = "macos")]
     let mut cmd = {
         let mut cmd = Command::new("osascript");
