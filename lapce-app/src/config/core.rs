@@ -22,4 +22,8 @@ pub struct CoreConfig {
         desc = "Enable auto-reload for the plugin when its configuration changes."
     )]
     pub auto_reload_plugin: bool,
+    #[field_names(
+        desc = "Sound of Claude chat notifications, a name from /System/Library/Sounds such as Glass or Ping (macOS). Empty for silent."
+    )]
+    pub claude_notification_sound: String,
 }

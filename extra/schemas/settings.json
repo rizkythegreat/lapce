@@ -176,6 +176,9 @@
                 },
                 "custom-titlebar": {
                     "type": "boolean"
+                },
+                "claude-notification-sound": {
+                    "type": "string"
                 }
             },
             "required": [],

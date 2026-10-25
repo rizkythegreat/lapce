@@ -1353,7 +1353,8 @@ impl ClaudeChatData {
     /// turn needn't be watched
     fn notify(&self, body: &str) {
         if !self.common.window_common.window_focused.get_untracked() {
-            system_notification(body);
+            let config = self.common.config.get_untracked();
+            system_notification(body, &config.core.claude_notification_sound);
         }
     }
 
@@ -1694,30 +1695,38 @@ fn path_mention(path: &Path, workspace: Option<&Path>) -> String {
 /// Shown by the OS as coming from Lapce when it runs as an app bundle,
 /// else through a command with the body passed as an argument, so it needs
 /// no escaping. Quietly does nothing where the command is missing.
-fn system_notification(body: &str) {
+// The sound is macOS only
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn system_notification(body: &str, sound: &str) {
     let body: String = body.chars().take(200).collect();
     #[cfg(target_os = "macos")]
     if objc2_foundation::NSBundle::mainBundle()
         .bundleIdentifier()
         .is_some()
     {
-        mac_notification(&body);
+        mac_notification(&body, sound);
         return;
     }
     // Run from outside an app bundle, e.g. `cargo run`
     #[cfg(target_os = "macos")]
     let mut cmd = {
+        let show = if sound.is_empty() {
+            "display notification (item 1 of argv) with title \"Claude\""
+        } else {
+            "display notification (item 1 of argv) with title \"Claude\" \
+             sound name (item 2 of argv)"
+        };
         let mut cmd = Command::new("osascript");
         cmd.args([
             "-e",
             "on run argv",
             "-e",
-            "display notification (item 1 of argv) with title \"Claude\" \
-             sound name \"Glass\"",
+            show,
             "-e",
             "end run",
             "--",
             body.as_str(),
+            sound,
         ]);
         cmd
     };
@@ -1738,12 +1747,14 @@ fn system_notification(body: &str) {
 // when it stops delivering. That one needs a signed app and a permission.
 #[cfg(target_os = "macos")]
 #[allow(deprecated)]
-fn mac_notification(body: &str) {
+fn mac_notification(body: &str, sound: &str) {
     use objc2_foundation::{NSString, NSUserNotification, NSUserNotificationCenter};
     let notification = NSUserNotification::new();
     notification.setTitle(Some(&NSString::from_str("Claude")));
     notification.setInformativeText(Some(&NSString::from_str(body)));
-    notification.setSoundName(Some(&NSString::from_str("Glass")));
+    if !sound.is_empty() {
+        notification.setSoundName(Some(&NSString::from_str(sound)));
+    }
     NSUserNotificationCenter::defaultUserNotificationCenter()
         .deliverNotification(&notification);
 }
