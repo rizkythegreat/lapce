@@ -234,6 +234,12 @@ fn header(
     let account = chat.account;
     let chat2 = chat.clone();
     let account_chat = chat.clone();
+    let update_chat = chat.clone();
+    let updating = chat.updating;
+    let update = create_memo({
+        let chat = chat.clone();
+        move |_| chat.update_available()
+    });
     // The first prompt names the conversation, like the session list does
     let title = create_memo(move |_| {
         messages.with(|messages| {
@@ -295,6 +301,14 @@ fn header(
                 })
         }),
         empty().style(|s| s.flex_grow(1.0f32)),
+        container(text_button(
+            move || format!("Update {}", update.get().unwrap_or_default()),
+            move || update_chat.update(),
+            config,
+        ))
+        .style(move |s| {
+            s.apply_if(update.get().is_none() || updating.get(), |s| s.hide())
+        }),
         usage_view(usage, config),
         clickable_icon(
             || LapceIcons::MENU,
@@ -656,6 +670,18 @@ fn show_account_menu(chat: &ClaudeChatData) {
     let account = chat.account.get_untracked();
     let name = account.clone().unwrap_or_else(|| "Not signed in".to_string());
     let mut menu = Menu::new("").entry(MenuItem::new(name).enabled(false));
+    if let Some(version) = chat.version.get_untracked() {
+        let version = format!("Claude Code {version}");
+        menu = menu.entry(MenuItem::new(version).enabled(false));
+    }
+    if chat.updating.get_untracked() {
+        let updating = MenuItem::new("Updating Claude Code...").enabled(false);
+        menu = menu.entry(updating);
+    } else if let Some(latest) = chat.update_available() {
+        let chat = chat.clone();
+        let update = MenuItem::new(format!("Update to {latest}"));
+        menu = menu.entry(update.action(move || chat.update()));
+    }
     if chat.signing_in() {
         let chat = chat.clone();
         let cancel = move || chat.cancel_login();

@@ -294,6 +294,12 @@ pub struct ClaudeChatData {
     /// Signed in account from `claude auth status`, None when signed out or
     /// not checked yet
     pub account: RwSignal<Option<String>>,
+    /// Claude Code's version, None until its process starts
+    pub version: RwSignal<Option<String>>,
+    /// The newest Claude Code on npm, looked up once the panel shows
+    pub latest_version: RwSignal<Option<String>>,
+    /// A `claude update` is running
+    pub updating: RwSignal<bool>,
     /// A running `claude auth login`, its stdin takes the pasted code
     login: Rc<RefCell<Option<(Child, ChildStdin)>>>,
     /// Login output chunks, None once its output closes
@@ -408,6 +414,9 @@ impl ClaudeChatData {
             resume_warning: cx.create_rw_signal(None),
             resume_idle: Rc::new(Cell::new(None)),
             account: cx.create_rw_signal(None),
+            version: cx.create_rw_signal(None),
+            latest_version: cx.create_rw_signal(None),
+            updating: cx.create_rw_signal(false),
             login: Rc::new(RefCell::new(None)),
             login_tx,
             process: Rc::new(RefCell::new(None)),
@@ -775,6 +784,7 @@ impl ClaudeChatData {
             return;
         }
         self.refresh_account(false);
+        self.check_latest_version();
         let running = self.process.borrow().is_some();
         if !running && let Err(e) = self.spawn() {
             self.push(ChatRole::Error, format!("Failed to start claude: {e}"));
@@ -1048,6 +1058,62 @@ impl ClaudeChatData {
         });
     }
 
+    /// Look up the newest Claude Code on npm, for the update badge
+    fn check_latest_version(&self) {
+        let latest = self.latest_version;
+        let send = create_ext_action(self.scope, move |version: Option<String>| {
+            latest.set(version);
+        });
+        std::thread::spawn(move || {
+            let url = "https://registry.npmjs.org/@anthropic-ai/claude-code/latest";
+            let version = lapce_proxy::get_url(url, Some("Lapce"))
+                .ok()
+                .and_then(|resp| resp.json::<Value>().ok())
+                .and_then(|json| json["version"].as_str().map(str::to_string));
+            send(version);
+        });
+    }
+
+    /// The newer version on npm, None when up to date or not known yet
+    pub fn update_available(&self) -> Option<String> {
+        let latest = self.latest_version.get()?;
+        let current = self.version.get()?;
+        is_newer(&latest, &current).then_some(latest)
+    }
+
+    /// Run `claude update`, then restart Claude Code so the next message
+    /// uses the new version
+    pub fn update(&self) {
+        if self.updating.get_untracked() {
+            return;
+        }
+        if self.busy.get_untracked() {
+            let text = "Stop or wait for the reply before updating.";
+            self.push(ChatRole::Error, text.to_string());
+            return;
+        }
+        self.updating.set(true);
+        self.push(ChatRole::Assistant, "Updating Claude Code...".to_string());
+        let chat = self.clone();
+        let send = create_ext_action(self.scope, move |result: Result<_, String>| {
+            chat.updating.set(false);
+            match result {
+                Ok(text) => {
+                    chat.push(ChatRole::Assistant, text);
+                    // The running process is still the old version
+                    chat.stop();
+                    chat.version.set(None);
+                    if let Err(e) = chat.spawn() {
+                        let text = format!("Failed to start claude: {e}");
+                        chat.push(ChatRole::Error, text);
+                    }
+                }
+                Err(text) => chat.push(ChatRole::Error, text),
+            }
+        });
+        std::thread::spawn(move || send(run_update()));
+    }
+
     /// `~/.claude/projects/<workspace path with non-alphanumerics as '-'>`
     fn sessions_dir(&self) -> Option<PathBuf> {
         let cwd = self
@@ -1191,6 +1257,9 @@ impl ClaudeChatData {
             Some("system") if event["subtype"] == "init" => {
                 if let Some(id) = event["session_id"].as_str() {
                     self.session_id.set(Some(id.to_string()));
+                }
+                if let Some(version) = event["claude_code_version"].as_str() {
+                    self.version.set(Some(version.to_string()));
                 }
             }
             Some("system") if event["subtype"] == "commands_changed" => {
@@ -1759,6 +1828,36 @@ fn mac_notification(body: &str, sound: &str) {
         .deliverNotification(&notification);
 }
 
+/// What `claude update` printed, or why it failed
+fn run_update() -> Result<String, String> {
+    let output = claude_command()
+        .arg("update")
+        .output()
+        .map_err(|e| format!("Failed to run claude update: {e}"))?;
+    let text = |bytes: &[u8], fallback: &str| {
+        let text = String::from_utf8_lossy(bytes).trim().to_string();
+        if text.is_empty() {
+            fallback.to_string()
+        } else {
+            text
+        }
+    };
+    if output.status.success() {
+        Ok(text(&output.stdout, "Claude Code updated."))
+    } else {
+        Err(text(&output.stderr, "claude update failed"))
+    }
+}
+
+/// Whether version `latest` is newer than `current`, false when either
+/// isn't a version
+fn is_newer(latest: &str, current: &str) -> bool {
+    match (semver::Version::parse(latest), semver::Version::parse(current)) {
+        (Ok(latest), Ok(current)) => latest > current,
+        _ => false,
+    }
+}
+
 /// `line 3` or `lines 3-7`
 fn line_range(start: usize, end: usize) -> String {
     if start == end {
@@ -2021,7 +2120,7 @@ mod tests {
         parse_applied, parse_models, read_history, replace_last_token,
         request_tokens, result_summary, result_text, session_title, tool_call,
         tool_summary, expand_pastes, paste_placeholder, diagnostics_prompt,
-        line_range,
+        line_range, is_newer,
     };
 
     #[test]
@@ -2342,5 +2441,14 @@ mod tests {
              - line 12, error (rustc): mismatched types\n  expected `u8`\n\
              - lines 1-3, problem: unused"
         );
+    }
+
+    #[test]
+    fn newer_version() {
+        assert!(is_newer("2.1.310", "2.1.309"));
+        assert!(is_newer("2.2.0", "2.1.310"));
+        assert!(!is_newer("2.1.310", "2.1.310"));
+        assert!(!is_newer("2.1.9", "2.1.10"));
+        assert!(!is_newer("latest", "2.1.310"));
     }
 }
