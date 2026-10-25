@@ -100,22 +100,6 @@ pub struct SlashCommand {
     pub hint: String,
 }
 
-/// An item of Claude's todo list, from its TodoWrite tool
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Todo {
-    pub content: String,
-    /// "Running tests" for "Run tests", shown while in progress
-    pub active_form: String,
-    pub status: TodoStatus,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum TodoStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
 /// A tool call waiting for the user's approval
 #[derive(Clone, Debug)]
 pub struct PermissionRequest {
@@ -294,8 +278,6 @@ pub struct ClaudeChatData {
     pub model: RwSignal<Option<String>>,
     /// None leaves Claude Code's default
     pub effort: RwSignal<Option<String>>,
-    /// Claude's todo list, replaced by each TodoWrite
-    pub todos: RwSignal<Vec<Todo>>,
     /// Pending tool approvals, oldest first
     pub permissions: RwSignal<im::Vector<PermissionRequest>>,
     /// Refreshed on spawn and after every turn, None until first answered
@@ -416,7 +398,6 @@ impl ClaudeChatData {
             models: cx.create_rw_signal(Vec::new()),
             model: cx.create_rw_signal(None),
             effort: cx.create_rw_signal(None),
-            todos: cx.create_rw_signal(Vec::new()),
             permissions: cx.create_rw_signal(im::Vector::new()),
             usage: cx.create_rw_signal(None),
             context: cx.create_rw_signal(None),
@@ -872,7 +853,6 @@ impl ClaudeChatData {
 
     pub fn new_session(&self) {
         self.stop();
-        self.todos.set(Vec::new());
         self.context.set(None);
         self.resume_warning.set(None);
         self.session_id.set(None);
@@ -893,7 +873,6 @@ impl ClaudeChatData {
 
     pub fn resume(&self, id: String) {
         self.stop();
-        self.todos.set(Vec::new());
         self.context.set(None);
         self.session_id.set(Some(id.clone()));
         self.messages.set(im::Vector::new());
@@ -1282,11 +1261,6 @@ impl ClaudeChatData {
                 let blocks = event["message"]["content"].as_array();
                 for block in blocks.into_iter().flatten() {
                     if block["type"] == "tool_use" {
-                        if block["name"] == "TodoWrite"
-                            && let Some(todos) = parse_todos(&block["input"])
-                        {
-                            self.todos.set(todos);
-                        }
                         self.push_message(
                             ChatRole::Tool,
                             tool_summary(block),
@@ -1341,19 +1315,6 @@ impl ClaudeChatData {
             }
             _ => {}
         }
-    }
-
-    /// The in-progress todo as "Running tests", for the working line
-    pub fn current_todo(&self) -> Option<String> {
-        self.todos.with(|todos| {
-            let todo = todos.iter().find(|t| t.status == TodoStatus::InProgress)?;
-            let text = if todo.active_form.is_empty() {
-                &todo.content
-            } else {
-                &todo.active_form
-            };
-            Some(text.clone())
-        })
     }
 
     /// A system notification while this window isn't focused, so a long
@@ -1683,24 +1644,6 @@ fn path_mention(path: &Path, workspace: Option<&Path>) -> String {
     }
 }
 
-/// The list a TodoWrite call sets, None when the input isn't one
-fn parse_todos(input: &Value) -> Option<Vec<Todo>> {
-    let todos = input["todos"].as_array()?.iter().map(|t| {
-        let status = match t["status"].as_str()? {
-            "in_progress" => TodoStatus::InProgress,
-            "completed" => TodoStatus::Completed,
-            _ => TodoStatus::Pending,
-        };
-        let active_form = t["activeForm"].as_str().unwrap_or_default();
-        Some(Todo {
-            content: t["content"].as_str()?.to_string(),
-            active_form: active_form.to_string(),
-            status,
-        })
-    });
-    todos.collect()
-}
-
 /// Shown by the OS with the body passed as an argument, so it needs no
 /// escaping. Quietly does nothing where the command is missing.
 fn system_notification(body: &str) {
@@ -1994,7 +1937,7 @@ mod tests {
         parse_applied, parse_models, read_history, replace_last_token,
         request_tokens, result_summary, result_text, session_title, tool_call,
         tool_summary, expand_pastes, paste_placeholder, diagnostics_prompt,
-        line_range, parse_todos, TodoStatus,
+        line_range,
     };
 
     #[test]
@@ -2310,24 +2253,5 @@ mod tests {
              - line 12, error (rustc): mismatched types\n  expected `u8`\n\
              - lines 1-3, problem: unused"
         );
-    }
-
-    #[test]
-    fn todo_list() {
-        let input = json!({"todos": [
-            {"content": "Run tests", "activeForm": "Running tests",
-             "status": "in_progress"},
-            {"content": "Fix lint", "status": "pending"},
-            {"content": "Read code", "activeForm": "Reading", "status": "completed"},
-        ]});
-        let todos = parse_todos(&input).unwrap();
-        let statuses: Vec<_> = todos.iter().map(|t| t.status).collect();
-        assert_eq!(
-            statuses,
-            [TodoStatus::InProgress, TodoStatus::Pending, TodoStatus::Completed]
-        );
-        assert_eq!(todos[0].active_form, "Running tests");
-        assert_eq!(todos[1].active_form, "");
-        assert_eq!(parse_todos(&json!({"command": "ls"})), None);
     }
 }

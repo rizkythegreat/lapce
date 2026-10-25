@@ -31,8 +31,8 @@ use crate::{
     app::{clickable_icon, tooltip_label},
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, ContextUsage, PERMISSION_MODES,
-        PermissionRequest, PopupItem, SessionInfo, TodoStatus, ToolCall, ToolStatus,
-        UsageLimits, UsageWindow, mention_query,
+        PermissionRequest, PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits,
+        UsageWindow, mention_query,
     },
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
@@ -111,6 +111,39 @@ pub fn claude_chat_panel(
         });
     }
 
+    let input_box = stack((
+        TextInputBuilder::new()
+            .is_focused(is_focused)
+            .build_editor(chat.editor.clone())
+            .placeholder(move || match suggestion.get() {
+                Some(suggestion) => format!("{suggestion}  (Enter to use)"),
+                None => "Ask Claude".to_string(),
+            })
+            .wrap()
+            // Grows with its lines, scrolls past this
+            .style(|s| {
+                s.width_full().min_width(0.0).padding(6.0).max_height(200.0)
+            }),
+        input_toolbar(chat.clone(), config),
+    ))
+    .on_event_cont(EventListener::PointerDown, move |_| {
+        focus.set(Focus::Panel(PanelKind::ClaudeChat));
+    })
+    .style(move |s| {
+        let config = config.get();
+        let border = if is_focused() {
+            LapceColor::EDITOR_FOCUS
+        } else {
+            LapceColor::LAPCE_BORDER
+        };
+        s.flex_col()
+            .margin(10.0)
+            .border(1.0)
+            .border_radius(8.0)
+            .border_color(config.color(border))
+            .background(config.color(LapceColor::EDITOR_BACKGROUND))
+    });
+
     stack((
         header(chat.clone(), window_tab_data.panel.clone(), config),
         sessions_view(chat.clone(), config),
@@ -130,7 +163,12 @@ pub fn claude_chat_panel(
                 )
                 .on_resize(move |rect| content_height.set(rect.height()))
                 .style(move |s| {
-                    s.flex_col().width(scroll_width.get()).padding(12.0).gap(6.0)
+                    let side = column_side(scroll_width.get(), &config.get());
+                    s.flex_col()
+                        .width(scroll_width.get())
+                        .padding(12.0)
+                        .padding_horiz(side.max(12.0))
+                        .gap(6.0)
                 }),
             )
             .on_scroll(move |rect| {
@@ -160,42 +198,17 @@ pub fn claude_chat_panel(
                 .flex_basis(0.0)
                 .apply_if(show_sessions.get(), |s| s.hide())
         }),
-        todo_view(chat.clone(), config),
-        working_view(chat.clone(), config),
-        resume_warning_view(chat.clone(), config),
-        permission_view(chat.clone(), config),
-        command_popup(chat.clone(), config),
+        // Lined up under the conversation column
         stack((
-            TextInputBuilder::new()
-                .is_focused(is_focused)
-                .build_editor(chat.editor.clone())
-                .placeholder(move || match suggestion.get() {
-                    Some(suggestion) => format!("{suggestion}  (Enter to use)"),
-                    None => "Ask Claude".to_string(),
-                })
-                .wrap()
-                // Grows with its lines, scrolls past this
-                .style(|s| {
-                    s.width_full().min_width(0.0).padding(6.0).max_height(200.0)
-                }),
-            input_toolbar(chat.clone(), config),
+            working_view(chat.clone(), config),
+            resume_warning_view(chat.clone(), config),
+            permission_view(chat.clone(), config),
+            command_popup(chat.clone(), config),
+            input_box,
         ))
-        .on_event_cont(EventListener::PointerDown, move |_| {
-            focus.set(Focus::Panel(PanelKind::ClaudeChat));
-        })
         .style(move |s| {
-            let config = config.get();
-            let border = if is_focused() {
-                LapceColor::EDITOR_FOCUS
-            } else {
-                LapceColor::LAPCE_BORDER
-            };
-            s.flex_col()
-                .margin(10.0)
-                .border(1.0)
-                .border_radius(8.0)
-                .border_color(config.color(border))
-                .background(config.color(LapceColor::EDITOR_BACKGROUND))
+            let side = column_side(scroll_width.get(), &config.get());
+            s.flex_col().width_full().padding_horiz(side)
         }),
     ))
     // Keeps the window from opening the dropped file in an editor
@@ -684,11 +697,7 @@ fn working_view(
         }
         busy_now
     });
-    let running = create_memo({
-        let chat = chat.clone();
-        move |_| chat.running_tool()
-    });
-    let todo = create_memo(move |_| chat.current_todo());
+    let running = create_memo(move |_| chat.running_tool());
 
     label(move || {
         let dots = ".".repeat(tick.get() % 3 + 1);
@@ -696,8 +705,6 @@ fn working_view(
             format!("Waiting for approval{dots}")
         } else if let Some(tool) = running.get() {
             format!("Running {tool}{dots}")
-        } else if let Some(todo) = todo.get() {
-            format!("{todo}{dots}")
         } else {
             format!("Thinking{dots}")
         }
@@ -707,54 +714,6 @@ fn working_view(
             .padding_vert(2.0)
             .color(config.get().color(LapceColor::EDITOR_DIM))
             .apply_if(!busy.get(), |s| s.hide())
-    })
-}
-
-/// Claude's todo list above the input, like the CLI shows it. Hidden
-/// until a TodoWrite and again once every item is done.
-fn todo_view(
-    chat: ClaudeChatData,
-    config: ReadSignal<Arc<LapceConfig>>,
-) -> impl View {
-    let todos = chat.todos;
-    let done = move || {
-        todos.with(|t| t.iter().all(|t| t.status == TodoStatus::Completed))
-    };
-    dyn_stack(
-        move || todos.get().into_iter().enumerate(),
-        |(i, todo)| (*i, todo.clone()),
-        move |(_, todo)| {
-            let marker = match todo.status {
-                TodoStatus::Completed => "✓",
-                TodoStatus::InProgress => "▸",
-                TodoStatus::Pending => "○",
-            };
-            let status = todo.status;
-            label(move || format!("{marker} {}", todo.content)).style(move |s| {
-                let config = config.get();
-                let color = if status == TodoStatus::InProgress {
-                    LapceColor::EDITOR_FOREGROUND
-                } else {
-                    LapceColor::EDITOR_DIM
-                };
-                s.width_full()
-                    .color(config.color(color))
-                    .apply_if(status == TodoStatus::InProgress, |s| s.font_bold())
-            })
-        },
-    )
-    .style(move |s| {
-        let config = config.get();
-        s.flex_col()
-            .gap(2.0)
-            .margin_horiz(10.0)
-            .margin_bottom(6.0)
-            .padding_horiz(10.0)
-            .padding_vert(6.0)
-            .border(1.0)
-            .border_radius(8.0)
-            .border_color(config.color(LapceColor::LAPCE_BORDER))
-            .apply_if(done(), |s| s.hide())
     })
 }
 
@@ -809,6 +768,24 @@ fn animate(
 const CHAT_LINE_HEIGHT: f64 = 1.5;
 /// About 80 characters of the UI font
 const REPLY_MAX_EMS: f64 = 44.0;
+/// Widest the conversation and input get, a reply plus its bullet gutter
+const COLUMN_MAX_EMS: f64 = 52.0;
+
+/// Side padding that centers the conversation column in a panel `width`
+/// wide, as in a maximized panel. 0 when the panel is narrower.
+fn column_side(width: f64, config: &LapceConfig) -> f64 {
+    let column = config.ui.font_size() as f64 * COLUMN_MAX_EMS;
+    ((width - column) / 2.0).max(0.0)
+}
+/// The conversation and input stay this wide, centered in a maximized panel
+const COLUMN_MAX_EMS: f64 = 52.0;
+
+/// Space on each side that centers the conversation column in a panel this
+/// wide, zero when the panel is narrower than the column
+fn column_side(width: f64, config: &LapceConfig) -> f64 {
+    let column = config.ui.font_size() as f64 * COLUMN_MAX_EMS;
+    ((width - column) / 2.0).max(0.0)
+}
 
 /// Wrapping plain text in the UI font
 fn plain_text(text: &str, color: Color, config: &LapceConfig) -> TextLayout {
