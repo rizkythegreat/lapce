@@ -45,6 +45,8 @@ pub struct WindowCommonData {
     pub size: RwSignal<Size>,
     pub num_window_tabs: Memo<usize>,
     pub window_maximized: RwSignal<bool>,
+    /// False while another app or window has focus
+    pub window_focused: RwSignal<bool>,
     pub window_tab_header_height: RwSignal<f64>,
     pub latest_release: ReadSignal<Arc<Option<ReleaseInfo>>>,
     pub ime_allowed: RwSignal<bool>,
@@ -106,6 +108,7 @@ impl WindowData {
         let window_command = Listener::new_empty(cx);
         let ime_allowed = cx.create_rw_signal(false);
         let window_maximized = cx.create_rw_signal(false);
+        let window_focused = cx.create_rw_signal(true);
         let size = cx.create_rw_signal(Size::ZERO);
         let window_tab_header_height = cx.create_rw_signal(0.0);
         let cursor_blink_timer = cx.create_rw_signal(TimerToken::INVALID);
@@ -117,6 +120,7 @@ impl WindowData {
             size,
             num_window_tabs,
             window_maximized,
+            window_focused,
             window_tab_header_height,
             latest_release,
             ime_allowed,

@@ -31,8 +31,8 @@ use crate::{
     app::{clickable_icon, tooltip_label},
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, ContextUsage, PERMISSION_MODES,
-        PermissionRequest, PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits,
-        UsageWindow, mention_query,
+        PermissionRequest, PopupItem, SessionInfo, TodoStatus, ToolCall, ToolStatus,
+        UsageLimits, UsageWindow, mention_query,
     },
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
@@ -160,6 +160,7 @@ pub fn claude_chat_panel(
                 .flex_basis(0.0)
                 .apply_if(show_sessions.get(), |s| s.hide())
         }),
+        todo_view(chat.clone(), config),
         working_view(chat.clone(), config),
         resume_warning_view(chat.clone(), config),
         permission_view(chat.clone(), config),
@@ -683,7 +684,11 @@ fn working_view(
         }
         busy_now
     });
-    let running = create_memo(move |_| chat.running_tool());
+    let running = create_memo({
+        let chat = chat.clone();
+        move |_| chat.running_tool()
+    });
+    let todo = create_memo(move |_| chat.current_todo());
 
     label(move || {
         let dots = ".".repeat(tick.get() % 3 + 1);
@@ -691,6 +696,8 @@ fn working_view(
             format!("Waiting for approval{dots}")
         } else if let Some(tool) = running.get() {
             format!("Running {tool}{dots}")
+        } else if let Some(todo) = todo.get() {
+            format!("{todo}{dots}")
         } else {
             format!("Thinking{dots}")
         }
@@ -700,6 +707,54 @@ fn working_view(
             .padding_vert(2.0)
             .color(config.get().color(LapceColor::EDITOR_DIM))
             .apply_if(!busy.get(), |s| s.hide())
+    })
+}
+
+/// Claude's todo list above the input, like the CLI shows it. Hidden
+/// until a TodoWrite and again once every item is done.
+fn todo_view(
+    chat: ClaudeChatData,
+    config: ReadSignal<Arc<LapceConfig>>,
+) -> impl View {
+    let todos = chat.todos;
+    let done = move || {
+        todos.with(|t| t.iter().all(|t| t.status == TodoStatus::Completed))
+    };
+    dyn_stack(
+        move || todos.get().into_iter().enumerate(),
+        |(i, todo)| (*i, todo.clone()),
+        move |(_, todo)| {
+            let marker = match todo.status {
+                TodoStatus::Completed => "✓",
+                TodoStatus::InProgress => "▸",
+                TodoStatus::Pending => "○",
+            };
+            let status = todo.status;
+            label(move || format!("{marker} {}", todo.content)).style(move |s| {
+                let config = config.get();
+                let color = if status == TodoStatus::InProgress {
+                    LapceColor::EDITOR_FOREGROUND
+                } else {
+                    LapceColor::EDITOR_DIM
+                };
+                s.width_full()
+                    .color(config.color(color))
+                    .apply_if(status == TodoStatus::InProgress, |s| s.font_bold())
+            })
+        },
+    )
+    .style(move |s| {
+        let config = config.get();
+        s.flex_col()
+            .gap(2.0)
+            .margin_horiz(10.0)
+            .margin_bottom(6.0)
+            .padding_horiz(10.0)
+            .padding_vert(6.0)
+            .border(1.0)
+            .border_radius(8.0)
+            .border_color(config.color(LapceColor::LAPCE_BORDER))
+            .apply_if(done(), |s| s.hide())
     })
 }
 
