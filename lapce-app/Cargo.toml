@@ -71,7 +71,12 @@ dmg      = "0.1.1"
 [target.'cfg(target_os="macos")'.dependencies.objc2-foundation]
 version          = "0.3"
 default-features = false
-features         = ["std", "NSBundle", "NSObject", "NSString", "NSUserNotification"]
+features         = ["std", "NSBundle", "NSData", "NSObject", "NSString", "NSUserNotification"]
+
+[target.'cfg(target_os="macos")'.dependencies.objc2-app-kit]
+version          = "0.3"
+default-features = false
+features         = ["std", "NSPasteboard"]
 
 [target.'cfg(windows)'.dependencies.windows-sys]
 workspace = true

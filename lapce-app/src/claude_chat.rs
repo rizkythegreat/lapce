@@ -266,9 +266,10 @@ pub struct ClaudeChatData {
     commands_requested: Rc<Cell<bool>>,
     /// Claude Code's guess at the next prompt, shown in the empty input
     pub suggestion: RwSignal<Option<String>>,
-    /// Long pastes, shown in the input as `[Pasted text #n ...]` and
-    /// expanded on send. Paste `#n` is at index n - 1.
-    pastes: Rc<RefCell<Vec<String>>>,
+    /// Long pastes, selections and images, shown in the input as a
+    /// placeholder like `[Pasted text #n ...]` and expanded on send. Paste
+    /// `#n` is at index n - 1, as (placeholder, content).
+    pastes: Rc<RefCell<Vec<(String, String)>>>,
     /// A `PERMISSION_MODES` value, "default" asks. Back to it on every
     /// launch.
     pub permission_mode: RwSignal<&'static str>,
@@ -357,7 +358,9 @@ impl KeyPressFocus for ClaudeChatData {
                 self.stop();
                 CommandExecuted::Yes
             }
-            CommandKind::Edit(EditCommand::ClipboardPaste) if self.paste_long() => {
+            CommandKind::Edit(EditCommand::ClipboardPaste)
+                if self.paste_long() || self.paste_image() =>
+            {
                 CommandExecuted::Yes
             }
             CommandKind::Edit(_)
@@ -538,7 +541,36 @@ impl ClaudeChatData {
             return false;
         }
         let placeholder = paste_placeholder(self.pastes.borrow().len() + 1, &text);
-        self.pastes.borrow_mut().push(text);
+        self.pastes.borrow_mut().push((placeholder.clone(), text));
+        self.editor.receive_char(&placeholder);
+        true
+    }
+
+    /// A clipboard image without text goes in as `[Image #n]`, saved to a
+    /// file Claude reads through an `@` mention
+    fn paste_image(&self) -> bool {
+        if SystemClipboard::new().get_string().is_some() {
+            return false;
+        }
+        let Some(png) = clipboard_png() else {
+            return false;
+        };
+        // ponytail: never deleted, macOS clears the temp dir after a few days
+        let dir = std::env::temp_dir().join("lapce-claude");
+        let stamp = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let path = dir.join(format!("paste-{stamp}.png"));
+        let saved = std::fs::create_dir_all(&dir)
+            .and_then(|()| std::fs::write(&path, png));
+        if let Err(e) = saved {
+            self.push(ChatRole::Error, format!("Failed to save the image: {e}"));
+            return true;
+        }
+        let placeholder = format!("[Image #{}]", self.pastes.borrow().len() + 1);
+        let mention = path_mention(&path, None);
+        self.pastes.borrow_mut().push((placeholder.clone(), mention));
         self.editor.receive_char(&placeholder);
         true
     }
@@ -771,7 +803,7 @@ impl ClaudeChatData {
         let mention = path_mention(path, self.common.workspace.path.as_deref());
         let code = format!("```\n{code}\n```");
         let placeholder = paste_placeholder(self.pastes.borrow().len() + 1, &code);
-        self.pastes.borrow_mut().push(code);
+        self.pastes.borrow_mut().push((placeholder.clone(), code));
         let lines = line_range(start, end);
         self.append_input(&format!("{mention} {lines} {placeholder}"));
     }
@@ -1603,12 +1635,27 @@ fn paste_placeholder(n: usize, text: &str) -> String {
 }
 
 /// The input with paste placeholders replaced by what was pasted
-fn expand_pastes(input: &str, pastes: &[String]) -> String {
+fn expand_pastes(input: &str, pastes: &[(String, String)]) -> String {
     let mut input = input.to_string();
-    for (i, text) in pastes.iter().enumerate() {
-        input = input.replace(&paste_placeholder(i + 1, text), text);
+    for (placeholder, content) in pastes {
+        input = input.replace(placeholder, content);
     }
     input
+}
+
+/// The clipboard's PNG, as a screenshot copied with Cmd+Ctrl+Shift+4 has
+#[cfg(target_os = "macos")]
+fn clipboard_png() -> Option<Vec<u8>> {
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+    // SAFETY: an AppKit constant, set before any code runs
+    let png = unsafe { NSPasteboardTypePNG };
+    let data = NSPasteboard::generalPasteboard().dataForType(png)?;
+    Some(data.to_vec())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clipboard_png() -> Option<Vec<u8>> {
+    None
 }
 
 /// Commands for the popup while the input is `/` plus a partial name.
@@ -1968,14 +2015,19 @@ mod tests {
 
     #[test]
     fn pastes_expand_on_send() {
-        let pastes = vec!["a\nb".to_string(), "c".to_string()];
-        let input = format!(
-            "fix {} and {}",
-            paste_placeholder(1, &pastes[0]),
-            paste_placeholder(2, &pastes[1])
-        );
+        let paste = |n, text: &str| (paste_placeholder(n, text), text.to_string());
+        let pastes = vec![
+            paste(1, "a\nb"),
+            paste(2, "c"),
+            ("[Image #3]".to_string(), "@/tmp/p.png".to_string()),
+        ];
+        let input =
+            format!("fix {} and {} like [Image #3]", pastes[0].0, pastes[1].0);
         assert!(input.contains("[Pasted text #1 +2 lines]"));
-        assert_eq!(expand_pastes(&input, &pastes), "fix a\nb and c");
+        assert_eq!(
+            expand_pastes(&input, &pastes),
+            "fix a\nb and c like @/tmp/p.png"
+        );
         assert_eq!(expand_pastes("no paste", &pastes), "no paste");
     }
 
