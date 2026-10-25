@@ -38,7 +38,6 @@ use crate::{
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
     doc::relative_time,
     editor::location::{EditorLocation, EditorPosition},
-    keypress::KeyPressFocus,
     listener::Listener,
     markdown::{
         Link, MarkdownContent, StreamedItem, StreamedMarkdown, link_at,
@@ -773,15 +772,6 @@ const COLUMN_MAX_EMS: f64 = 52.0;
 
 /// Side padding that centers the conversation column in a panel `width`
 /// wide, as in a maximized panel. 0 when the panel is narrower.
-fn column_side(width: f64, config: &LapceConfig) -> f64 {
-    let column = config.ui.font_size() as f64 * COLUMN_MAX_EMS;
-    ((width - column) / 2.0).max(0.0)
-}
-/// The conversation and input stay this wide, centered in a maximized panel
-const COLUMN_MAX_EMS: f64 = 52.0;
-
-/// Space on each side that centers the conversation column in a panel this
-/// wide, zero when the panel is narrower than the column
 fn column_side(width: f64, config: &LapceConfig) -> f64 {
     let column = config.ui.font_size() as f64 * COLUMN_MAX_EMS;
     ((width - column) / 2.0).max(0.0)
