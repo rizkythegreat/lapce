@@ -938,15 +938,28 @@ fn permission_card(
             )
         },
     );
+    // Scroll content is unbounded, give it the visible width so text wraps
+    let detail_width = create_rw_signal(0.0);
     stack((
         label(move || title.clone()).style(|s| s.font_bold()),
-        rich_text(move || {
-            let config = config.get();
-            let color = config.color(LapceColor::EDITOR_FOREGROUND);
-            plain_text(&detail, color, &config)
+        scroll(
+            rich_text(move || {
+                let config = config.get();
+                let color = config.color(LapceColor::EDITOR_FOREGROUND);
+                plain_text(&detail, color, &config)
+            })
+            // Lets a long command wrap instead of widening the card
+            .style(move |s| s.width(detail_width.get()).min_width(0.0)),
+        )
+        .on_resize(move |rect| {
+            if detail_width.get_untracked() != rect.width() {
+                detail_width.set(rect.width());
+            }
         })
-        // Lets a long command wrap instead of widening the card
-        .style(|s| s.width_full().min_width(0.0).margin_vert(6.0)),
+        // A long input scrolls, the answers below stay in view
+        .style(|s| {
+            s.width_full().min_width(0.0).max_height(240.0).margin_vert(6.0)
+        }),
         stack_from_iter(options).style(|s| s.flex_col().width_full().gap(4.0)),
         label(|| "Or type below to tell Claude what to do instead").style(
             move |s| {
