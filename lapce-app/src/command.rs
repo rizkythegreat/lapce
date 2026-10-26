@@ -520,6 +520,10 @@ pub enum LapceWorkbenchCommand {
     #[strum(serialize = "toggle_search_visual")]
     ToggleSearchVisual,
 
+    #[strum(message = "Toggle Markdown Preview")]
+    #[strum(serialize = "toggle_markdown_preview")]
+    ToggleMarkdownPreview,
+
     #[strum(serialize = "focus_editor")]
     FocusEditor,
 

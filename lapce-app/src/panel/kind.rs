@@ -20,6 +20,7 @@ pub enum PanelKind {
     References,
     Implementation,
     ClaudeChat,
+    MarkdownPreview,
 }
 
 impl PanelKind {
@@ -37,6 +38,7 @@ impl PanelKind {
             PanelKind::References => LapceIcons::REFERENCES,
             PanelKind::Implementation => LapceIcons::IMPLEMENTATION,
             PanelKind::ClaudeChat => LapceIcons::LIGHTBULB,
+            PanelKind::MarkdownPreview => LapceIcons::FILE,
         }
     }
 
@@ -64,6 +66,7 @@ impl PanelKind {
             PanelKind::References => PanelPosition::BottomLeft,
             PanelKind::Implementation => PanelPosition::BottomLeft,
             PanelKind::ClaudeChat => PanelPosition::RightTop,
+            PanelKind::MarkdownPreview => PanelPosition::RightTop,
         }
     }
 }

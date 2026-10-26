@@ -1348,6 +1348,9 @@ impl WindowTabData {
             ToggleDebugVisual => {
                 self.toggle_panel_visual(PanelKind::Debug);
             }
+            ToggleMarkdownPreview => {
+                self.toggle_panel_visual(PanelKind::MarkdownPreview);
+            }
             ToggleSearchVisual => {
                 self.toggle_panel_visual(PanelKind::Search);
             }
@@ -2759,7 +2762,8 @@ impl WindowTabData {
             | PanelKind::CallHierarchy
             | PanelKind::DocumentSymbol
             | PanelKind::References
-            | PanelKind::Implementation => {
+            | PanelKind::Implementation
+            | PanelKind::MarkdownPreview => {
                 // Some panels don't accept focus (yet). Fall back to visibility check
                 // in those cases.
                 self.panel.is_panel_visible(&kind)

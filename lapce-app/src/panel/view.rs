@@ -21,6 +21,7 @@ use super::{
     debug_view::debug_panel,
     global_search_view::global_search_panel,
     kind::PanelKind,
+    markdown_preview_view::markdown_preview_panel,
     plugin_view::plugin_panel,
     position::{PanelContainerPosition, PanelPosition},
     problem_view::problem_panel,
@@ -520,6 +521,10 @@ fn panel_view(
                 PanelKind::ClaudeChat => {
                     claude_chat_panel(window_tab_data.clone(), position).into_any()
                 }
+                PanelKind::MarkdownPreview => {
+                    markdown_preview_panel(window_tab_data.clone(), position)
+                        .into_any()
+                }
             };
             view.style(|s| s.size_pct(100.0, 100.0))
         },
@@ -578,6 +583,7 @@ fn panel_picker(
                 PanelKind::References => "References",
                 PanelKind::Implementation => "Implementation",
                 PanelKind::ClaudeChat => "Claude",
+                PanelKind::MarkdownPreview => "Markdown Preview",
             };
             let icon = p.svg_name();
             let is_active = {

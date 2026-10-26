@@ -44,7 +44,11 @@ pub fn default_panel_order() -> PanelOrder {
     );
     order.insert(
         PanelPosition::RightTop,
-        im::vector![PanelKind::DocumentSymbol, PanelKind::ClaudeChat],
+        im::vector![
+            PanelKind::DocumentSymbol,
+            PanelKind::ClaudeChat,
+            PanelKind::MarkdownPreview
+        ],
     );
 
     order
