@@ -5,6 +5,7 @@ use floem::{
     reactive::{SignalGet, SignalWith},
     views::{Decorators, container, dyn_stack, empty, rich_text, scroll},
 };
+use lapce_core::buffer::rope_text::RopeText;
 
 use super::{kind::PanelKind, position::PanelPosition};
 use crate::{
