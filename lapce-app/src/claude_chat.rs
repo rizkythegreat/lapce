@@ -1563,27 +1563,29 @@ fn list_sessions(dir: &Path) -> Vec<SessionInfo> {
         .collect()
 }
 
-/// The first `ai-title` record, else the last prompt. `None` for sessions
-/// without a prompt.
+/// The last `/rename` title, else the first `ai-title`, else the last
+/// prompt. `None` for sessions without any.
 fn session_title(reader: impl BufRead) -> Option<String> {
-    let mut prompt = None;
+    let (mut custom, mut ai, mut prompt) = (None, None, None);
     for line in reader.lines() {
         let Ok(line) = line else { break };
         // Cheap filter before parsing, session files can be megabytes
-        if !line.contains("\"ai-title\"") && !line.contains("\"last-prompt\"") {
+        let titled = ["\"custom-title\"", "\"ai-title\"", "\"last-prompt\""];
+        if !titled.iter().any(|kind| line.contains(kind)) {
             continue;
         }
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        if let Some(title) = record["aiTitle"].as_str() {
-            return Some(title.to_string());
-        }
-        if let Some(text) = record["lastPrompt"].as_str() {
+        if let Some(title) = record["customTitle"].as_str() {
+            custom = Some(title.to_string());
+        } else if let Some(title) = record["aiTitle"].as_str() {
+            ai.get_or_insert_with(|| title.to_string());
+        } else if let Some(text) = record["lastPrompt"].as_str() {
             prompt = Some(text.lines().next().unwrap_or_default().to_string());
         }
     }
-    prompt
+    custom.or(ai).or(prompt)
 }
 
 /// Rebuild the visible chat from a session file
@@ -2424,7 +2426,7 @@ mod tests {
     }
 
     #[test]
-    fn session_title_prefers_ai_title() {
+    fn session_title_prefers_rename_then_ai_title() {
         let file = [
             json!({"type": "last-prompt", "lastPrompt": "fix it\nplease"}),
             json!({"type": "ai-title", "aiTitle": "Fix bug"}),
@@ -2435,6 +2437,16 @@ mod tests {
         let first = file.lines().next().unwrap();
         assert_eq!(session_title(first.as_bytes()).as_deref(), Some("fix it"));
         assert_eq!(session_title("".as_bytes()), None);
+        // A renamed session, its prompt records carry no text
+        let renamed = [
+            json!({"type": "custom-title", "customTitle": "first"}),
+            json!({"type": "last-prompt", "leafUuid": "x"}),
+            json!({"type": "ai-title", "aiTitle": "Fix bug"}),
+            json!({"type": "custom-title", "customTitle": "backdate"}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n");
+        assert_eq!(session_title(renamed.as_bytes()).as_deref(), Some("backdate"));
     }
 
     #[test]
