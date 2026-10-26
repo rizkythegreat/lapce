@@ -847,7 +847,6 @@ impl ClaudeChatData {
         self.set_input(format!("{input}{sep}{text} "));
     }
 
-    /// Replace the input and put the cursor at its end
     /// Starts a slash command in an empty input, opening the command popup
     pub fn start_command(&self) {
         let empty = self.editor.doc().buffer.with_untracked(|b| b.is_empty());
@@ -862,6 +861,7 @@ impl ClaudeChatData {
         self.send();
     }
 
+    /// Replace the input and put the cursor at its end
     fn set_input(&self, text: String) {
         let len = text.len();
         self.editor.doc().reload(Rope::from(text), true);
