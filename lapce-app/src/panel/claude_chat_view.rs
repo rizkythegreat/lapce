@@ -1188,18 +1188,28 @@ fn message_view(
         internal_command,
     };
     let body = match role {
-        ChatRole::User => container(text_view(msg.text, role, opener, config))
-            .style(move |s| {
-                let config = config.get();
-                s.max_width_pct(85.0)
-                    .padding_horiz(10.0)
-                    .padding_vert(2.0)
-                    .border(1.0)
-                    .border_radius(6.0)
-                    .border_color(config.color(LapceColor::LAPCE_BORDER))
-                    .background(config.color(LapceColor::PANEL_CURRENT_BACKGROUND))
-            })
-            .into_any(),
+        ChatRole::User => {
+            let text = msg.text;
+            stack((
+                container(text_view(text, role, opener, config)).style(
+                    move |s| {
+                        let config = config.get();
+                        s.max_width_pct(85.0)
+                            .padding_horiz(10.0)
+                            .padding_vert(2.0)
+                            .border(1.0)
+                            .border_radius(6.0)
+                            .border_color(config.color(LapceColor::LAPCE_BORDER))
+                            .background(
+                                config.color(LapceColor::PANEL_CURRENT_BACKGROUND),
+                            )
+                    },
+                ),
+                copy_button(move || text.get_untracked(), config),
+            ))
+            .style(|s| s.flex_col().width_full().items_start().gap(2.0))
+            .into_any()
+        }
         ChatRole::Assistant => {
             let text = msg.text;
             bulleted(

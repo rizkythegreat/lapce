@@ -19,7 +19,7 @@ use floem::{
 };
 use lapce_core::{
     buffer::rope_text::RopeText,
-    command::{EditCommand, FocusCommand},
+    command::{EditCommand, FocusCommand, MoveCommand},
     directory::Directory,
     mode::Mode,
     register::Clipboard,
@@ -270,6 +270,9 @@ pub struct ClaudeChatData {
     /// placeholder like `[Pasted text #n ...]` and expanded on send. Paste
     /// `#n` is at index n - 1, as (placeholder, content).
     pastes: Rc<RefCell<Vec<(String, String)>>>,
+    /// While Up/Down walk the sent prompts: the one shown and the input
+    /// typed before, put back after the newest
+    recalled: Rc<RefCell<Option<(usize, String)>>>,
     /// A `PERMISSION_MODES` value, "default" asks. Back to it on every
     /// launch.
     pub permission_mode: RwSignal<&'static str>,
@@ -348,6 +351,12 @@ impl KeyPressFocus for ClaudeChatData {
                 self.select_popup_item();
                 CommandExecuted::Yes
             }
+            CommandKind::Move(MoveCommand::Up) if self.recall_prompt(true) => {
+                CommandExecuted::Yes
+            }
+            CommandKind::Move(MoveCommand::Down) if self.recall_prompt(false) => {
+                CommandExecuted::Yes
+            }
             // Shift+Enter starts a new line, plain Enter sends
             CommandKind::Edit(EditCommand::InsertNewLine) if mods.shift() => {
                 self.editor.receive_char("\n");
@@ -403,6 +412,7 @@ impl ClaudeChatData {
             commands_requested: Rc::new(Cell::new(false)),
             suggestion: cx.create_rw_signal(None),
             pastes: Rc::new(RefCell::new(Vec::new())),
+            recalled: Rc::new(RefCell::new(None)),
             permission_mode: cx.create_rw_signal("default"),
             models: cx.create_rw_signal(Vec::new()),
             model: cx.create_rw_signal(None),
@@ -453,6 +463,7 @@ impl ClaudeChatData {
     }
 
     pub fn send(&self) {
+        self.recalled.take();
         let text = self.editor.doc().buffer.with_untracked(|b| b.to_string());
         let text = text.trim();
         // What Claude gets, the chat keeps the short placeholders
@@ -872,6 +883,38 @@ impl ClaudeChatData {
         } else {
             self.apply_item(item);
         }
+    }
+
+    /// Up on the first line and Down on the last walk the sent prompts,
+    /// like a shell. False leaves the key to the editor.
+    fn recall_prompt(&self, older: bool) -> bool {
+        let offset = self.editor.cursor().with_untracked(|c| c.offset());
+        let (input, line, last) = self.editor.doc().buffer.with_untracked(|b| {
+            (b.to_string(), b.line_of_offset(offset), b.last_line())
+        });
+        if line != if older { 0 } else { last } {
+            return false;
+        }
+        let prompts: Vec<String> = self.messages.with_untracked(|messages| {
+            messages
+                .iter()
+                .filter(|m| m.role == ChatRole::User)
+                .map(|m| m.text.get_untracked())
+                .collect()
+        });
+        let index = self.recalled.borrow().as_ref().map(|(i, _)| *i);
+        let Some(next) = history_step(prompts.len(), index, older) else {
+            return false;
+        };
+        let draft = self.recalled.take().map_or(input, |(_, draft)| draft);
+        match next {
+            Some(i) => {
+                self.set_input(prompts[i].clone());
+                self.recalled.replace(Some((i, draft)));
+            }
+            None => self.set_input(draft),
+        }
+        true
     }
 
     fn move_popup_index(&self, delta: isize) {
@@ -1705,6 +1748,21 @@ fn paste_placeholder(n: usize, text: &str) -> String {
 }
 
 /// The input with paste placeholders replaced by what was pasted
+/// The prompt index after Up (`older`) or Down from `index`, None when
+/// the key goes nowhere, Some(None) back to the typed input
+fn history_step(
+    len: usize,
+    index: Option<usize>,
+    older: bool,
+) -> Option<Option<usize>> {
+    match (index, older) {
+        (None, true) => len.checked_sub(1).map(Some),
+        (Some(i), true) => i.checked_sub(1).map(Some),
+        (None, false) => None,
+        (Some(i), false) => Some((i + 1 < len).then_some(i + 1)),
+    }
+}
+
 fn expand_pastes(input: &str, pastes: &[(String, String)]) -> String {
     let mut input = input.to_string();
     for (placeholder, content) in pastes {
@@ -2120,8 +2178,18 @@ mod tests {
         parse_applied, parse_models, read_history, replace_last_token,
         request_tokens, result_summary, result_text, session_title, tool_call,
         tool_summary, expand_pastes, paste_placeholder, diagnostics_prompt,
-        line_range, is_newer,
+        line_range, is_newer, history_step,
     };
+
+    #[test]
+    fn history_walks_prompts() {
+        assert_eq!(history_step(0, None, true), None);
+        assert_eq!(history_step(3, None, true), Some(Some(2)));
+        assert_eq!(history_step(3, Some(0), true), None);
+        assert_eq!(history_step(3, Some(1), false), Some(Some(2)));
+        assert_eq!(history_step(3, Some(2), false), Some(None));
+        assert_eq!(history_step(3, None, false), None);
+    }
 
     #[test]
     fn pastes_expand_on_send() {
