@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     rc::Rc,
-    sync::mpsc::{Sender, channel},
+    sync::{
+        LazyLock, Mutex,
+        mpsc::{Sender, channel},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -1073,6 +1076,38 @@ impl ClaudeChatData {
         });
     }
 
+    /// Run Claude Code as another signed in account. The accounts share
+    /// sessions, so the next message resumes this one.
+    // ponytail: other windows keep their running Claude Code on the old
+    // account until it restarts
+    pub fn switch_account(&self, account: Option<PathBuf>) {
+        self.stop();
+        self.usage.set(None);
+        set_active_account(account);
+        self.refresh_account(true);
+    }
+
+    /// Sign in to one more account, kept beside the others
+    pub fn add_account(&self) {
+        let dirs = accounts_dir().zip(default_config_dir());
+        let Some(((accounts, shared), shared_file)) = dirs.zip(account_file(None))
+        else {
+            return;
+        };
+        match account_to_add(&accounts, &shared, &shared_file) {
+            Ok(dir) => {
+                set_active_account(Some(dir));
+                self.account.set(None);
+                self.usage.set(None);
+                self.login();
+            }
+            Err(e) => {
+                let error = format!("Failed to add an account: {e}");
+                self.push(ChatRole::Error, error);
+            }
+        }
+    }
+
     /// Read the account from `claude auth status`. `announce` says the result
     /// in the chat and restarts Claude Code under the new account.
     fn refresh_account(&self, announce: bool) {
@@ -1165,9 +1200,7 @@ impl ClaudeChatData {
             .path
             .clone()
             .or_else(|| std::env::current_dir().ok())?;
-        let config = std::env::var_os("CLAUDE_CONFIG_DIR")
-            .map(PathBuf::from)
-            .or_else(|| Directory::home_dir().map(|home| home.join(".claude")))?;
+        let config = active_account().or_else(default_config_dir)?;
         Some(config.join("projects").join(project_dir_name(&cwd)))
     }
 
@@ -1660,13 +1693,152 @@ fn parse_applied(applied: &Value) -> AppliedSettings {
     }
 }
 
-/// `claude` without a console window on Windows
+/// `claude` as the active account, without a console window on Windows
 fn claude_command() -> Command {
-    #[allow(unused_mut)]
     let mut cmd = Command::new("claude");
+    if let Some(dir) = active_account() {
+        cmd.env("CLAUDE_CONFIG_DIR", dir);
+    }
     #[cfg(target_os = "windows")]
     std::os::windows::process::CommandExt::creation_flags(&mut cmd, 0x08000000);
     cmd
+}
+
+/// What accounts added here share with the default one, so only the login
+/// differs
+const SHARED_CONFIG: [&str; 7] = [
+    "projects",
+    "settings.json",
+    "CLAUDE.md",
+    "plugins",
+    "skills",
+    "agents",
+    "commands",
+];
+
+/// The default account's directory, where Claude Code keeps settings and
+/// sessions unless told otherwise
+fn default_config_dir() -> Option<PathBuf> {
+    std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| Directory::home_dir().map(|home| home.join(".claude")))
+}
+
+/// Accounts added here, each a Claude Code config directory with its own
+/// login. Claude Code names the keychain entry after that directory.
+fn accounts_dir() -> Option<PathBuf> {
+    Directory::home_dir().map(|home| home.join(".claude-accounts"))
+}
+
+/// The added account Claude Code runs as, None for the default one. Shared
+/// by every window and kept in `~/.claude-accounts/active`.
+static ACCOUNT: LazyLock<Mutex<Option<PathBuf>>> = LazyLock::new(|| {
+    let saved = accounts_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join("active")).ok())
+        .map(|path| PathBuf::from(path.trim()))
+        .filter(|path| path.is_dir());
+    Mutex::new(saved)
+});
+
+fn active_account() -> Option<PathBuf> {
+    ACCOUNT.lock().unwrap().clone()
+}
+
+fn set_active_account(account: Option<PathBuf>) {
+    if let Some(accounts) = accounts_dir() {
+        let saved = accounts.join("active");
+        let _ = match &account {
+            Some(dir) => std::fs::write(saved, dir.to_string_lossy().as_bytes()),
+            None => std::fs::remove_file(saved),
+        };
+    }
+    *ACCOUNT.lock().unwrap() = account;
+}
+
+/// An account's `.claude.json`, which holds its login and MCP servers
+fn account_file(account: Option<&Path>) -> Option<PathBuf> {
+    match account {
+        Some(dir) => Some(dir.join(".claude.json")),
+        // The default account's sits beside `~/.claude`, not in it
+        None => match std::env::var_os("CLAUDE_CONFIG_DIR") {
+            Some(dir) => Some(PathBuf::from(dir).join(".claude.json")),
+            None => Directory::home_dir().map(|home| home.join(".claude.json")),
+        },
+    }
+}
+
+/// The email signed in to an account, None when signed out
+fn account_email(account: Option<&Path>) -> Option<String> {
+    let text = std::fs::read_to_string(account_file(account)?).ok()?;
+    let config: Value = serde_json::from_str(&text).ok()?;
+    config["oauthAccount"]["emailAddress"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Every signed in account but the active one, with its email
+pub fn other_accounts() -> Vec<(Option<PathBuf>, String)> {
+    let active = active_account();
+    let added = accounts_dir()
+        .and_then(|dir| std::fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir());
+    let mut accounts: Vec<_> = std::iter::once(None)
+        .chain(added.map(Some))
+        .filter(|account| *account != active)
+        .filter_map(|account| {
+            let email = account_email(account.as_deref())?;
+            Some((account, email))
+        })
+        .collect();
+    accounts.sort_by(|a, b| a.1.cmp(&b.1));
+    accounts
+}
+
+/// A directory to sign in to one more account: a signed out one, or a new
+/// one sharing the default account's sessions, settings, plugins, skills
+/// and MCP servers
+fn account_to_add(
+    accounts: &Path,
+    shared: &Path,
+    shared_file: &Path,
+) -> std::io::Result<PathBuf> {
+    let mut n = 1;
+    let dir = loop {
+        let dir = accounts.join(n.to_string());
+        if !dir.exists() || account_email(Some(dir.as_path())).is_none() {
+            break dir;
+        }
+        n += 1;
+    };
+    if dir.exists() {
+        return Ok(dir);
+    }
+    std::fs::create_dir_all(&dir)?;
+    // Made now so sessions under either account land in one place
+    std::fs::create_dir_all(shared.join("projects"))?;
+    // ponytail: only links what exists now, a skills folder made later
+    // stays with the default account
+    #[cfg(unix)]
+    for name in SHARED_CONFIG {
+        let target = shared.join(name);
+        if target.exists() {
+            std::os::unix::fs::symlink(&target, dir.join(name))?;
+        }
+    }
+    let servers = std::fs::read_to_string(shared_file)
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|config| config["mcpServers"].clone())
+        .filter(Value::is_object);
+    if let Some(servers) = servers {
+        let config = json!({ "mcpServers": servers }).to_string();
+        std::fs::write(dir.join(".claude.json"), config)?;
+    }
+    Ok(dir)
 }
 
 /// Send what a login process prints as it comes, its code prompt has no
@@ -2180,7 +2352,7 @@ mod tests {
         parse_applied, parse_models, read_history, replace_last_token,
         request_tokens, result_summary, result_text, session_title, tool_call,
         tool_summary, expand_pastes, paste_placeholder, diagnostics_prompt,
-        line_range, is_newer, history_step,
+        line_range, is_newer, history_step, account_to_add,
     };
 
     #[test]
@@ -2530,5 +2702,34 @@ mod tests {
         assert!(!is_newer("2.1.310", "2.1.310"));
         assert!(!is_newer("2.1.9", "2.1.10"));
         assert!(!is_newer("latest", "2.1.310"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adds_accounts_sharing_sessions() {
+        let root = std::env::temp_dir()
+            .join(format!("lapce-accounts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let accounts = root.join("accounts");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(shared.join("skills")).unwrap();
+        let shared_file = root.join("shared.json");
+        let config = r#"{"mcpServers":{"rea":{}},"oauthAccount":{}}"#;
+        std::fs::write(&shared_file, config).unwrap();
+        let add = || account_to_add(&accounts, &shared, &shared_file).unwrap();
+
+        let first = add();
+        assert_eq!(first, accounts.join("1"));
+        assert!(first.join("projects").is_dir());
+        assert!(first.join("skills").is_dir());
+        assert!(!first.join("plugins").exists());
+        let config = std::fs::read_to_string(first.join(".claude.json")).unwrap();
+        assert_eq!(config, r#"{"mcpServers":{"rea":{}}}"#);
+        // Still signed out, so offered again
+        assert_eq!(add(), first);
+        let signed_in = r#"{"oauthAccount":{"emailAddress":"a@b"}}"#;
+        std::fs::write(first.join(".claude.json"), signed_in).unwrap();
+        assert_eq!(add(), accounts.join("2"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

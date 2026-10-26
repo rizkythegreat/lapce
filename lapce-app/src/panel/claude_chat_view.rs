@@ -32,7 +32,7 @@ use crate::{
     claude_chat::{
         ChatMessage, ChatRole, ClaudeChatData, ContextUsage, PERMISSION_MODES,
         PermissionRequest, PopupItem, SessionInfo, ToolCall, ToolStatus, UsageLimits,
-        UsageWindow, mention_query,
+        UsageWindow, mention_query, other_accounts,
     },
     command::InternalCommand,
     config::{LapceConfig, color::LapceColor, icon::LapceIcons},
@@ -664,8 +664,9 @@ fn show_choice_menu<T: Clone + PartialEq + 'static>(
     show_context_menu(menu, None);
 }
 
-/// The account, then sign in, switch or sign out. Signing in runs in the
-/// chat: its output shows there and the input takes the code it asks for.
+/// The account, then switch, add, sign in or sign out. Signing in runs in
+/// the chat: its output shows there and the input takes the code it asks
+/// for.
 fn show_account_menu(chat: &ClaudeChatData) {
     let account = chat.account.get_untracked();
     let name = account.clone().unwrap_or_else(|| "Not signed in".to_string());
@@ -687,17 +688,22 @@ fn show_account_menu(chat: &ClaudeChatData) {
         let cancel = move || chat.cancel_login();
         menu = menu.entry(MenuItem::new("Cancel sign-in").action(cancel));
     } else {
+        for (dir, email) in other_accounts() {
+            let chat = chat.clone();
+            let switch = move || chat.switch_account(dir.clone());
+            let item = MenuItem::new(format!("Switch to {email}"));
+            menu = menu.entry(item.action(switch));
+        }
         let login = chat.clone();
-        let text = if account.is_some() {
-            "Switch account"
-        } else {
-            "Log in"
-        };
-        menu = menu.entry(MenuItem::new(text).action(move || login.login()));
         if account.is_some() {
+            let add = move || login.add_account();
+            menu = menu.entry(MenuItem::new("Add account").action(add));
             let chat = chat.clone();
             let logout = move || chat.logout();
             menu = menu.entry(MenuItem::new("Log out").action(logout));
+        } else {
+            let login = move || login.login();
+            menu = menu.entry(MenuItem::new("Log in").action(login));
         }
     }
     show_context_menu(menu, None);
