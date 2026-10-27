@@ -59,6 +59,8 @@ pub struct Dispatcher {
     catalog_rpc: PluginCatalogRpcHandler,
     buffers: HashMap<PathBuf, Buffer>,
     terminals: HashMap<TermId, TerminalSender>,
+    /// Paths with a blame running, each with the request waiting behind it
+    blames: Arc<Mutex<HashMap<PathBuf, Option<(RequestId, u64, String)>>>>,
     file_watcher: FileWatcher,
     window_id: usize,
     tab_id: usize,
@@ -560,18 +562,49 @@ impl ProxyHandler for Dispatcher {
                     );
                     return;
                 };
-                let rev = buffer.rev;
-                let content = buffer.get_document();
+                let job = (id, buffer.rev, buffer.get_document());
+                // One blame per path at a time. A request arriving mid-run
+                // waits for it, replacing any older request still waiting.
+                let mut blames = self.blames.lock();
+                if let Some(waiting) = blames.get_mut(&path) {
+                    let superseded = waiting.replace(job);
+                    drop(blames);
+                    if let Some((old_id, ..)) = superseded {
+                        self.respond_rpc(
+                            old_id,
+                            Err(RpcError {
+                                code: 0,
+                                message: "superseded by a newer blame".to_string(),
+                            }),
+                        );
+                    }
+                    return;
+                }
+                blames.insert(path.clone(), None);
+                drop(blames);
+                let blames = self.blames.clone();
                 let proxy_rpc = self.proxy_rpc.clone();
                 // Blame walks history, keep it off the dispatch thread
                 thread::spawn(move || {
-                    let result = git_blame(&workspace, &path, content.as_bytes())
-                        .map(|hunks| ProxyResponse::GitBlameResponse { rev, hunks })
-                        .map_err(|e| RpcError {
-                            code: 0,
-                            message: e.to_string(),
-                        });
-                    proxy_rpc.handle_response(id, result);
+                    let mut job = Some(job);
+                    while let Some((id, rev, content)) = job {
+                        let result =
+                            git_blame(&workspace, &path, content.as_bytes())
+                                .map(|hunks| ProxyResponse::GitBlameResponse {
+                                    rev,
+                                    hunks,
+                                })
+                                .map_err(|e| RpcError {
+                                    code: 0,
+                                    message: e.to_string(),
+                                });
+                        proxy_rpc.handle_response(id, result);
+                        let mut waiting = blames.lock();
+                        job = waiting.get_mut(&path).and_then(Option::take);
+                        if job.is_none() {
+                            waiting.remove(&path);
+                        }
+                    }
                 });
             }
             GetDefinition {
@@ -1287,6 +1320,7 @@ impl Dispatcher {
             catalog_rpc: plugin_rpc,
             buffers: HashMap::new(),
             terminals: HashMap::new(),
+            blames: Arc::new(Mutex::new(HashMap::new())),
             file_watcher,
             window_id: 1,
             tab_id: 1,
