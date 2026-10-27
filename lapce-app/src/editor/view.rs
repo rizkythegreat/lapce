@@ -33,7 +33,7 @@ use floem::{
                 DiffSectionKind, EditorView as FloemEditorView, EditorViewClass,
                 LineRegion, ScreenLines, cursor_caret,
             },
-            visual_line::{RVLine, VLine},
+            visual_line::RVLine,
         },
         empty, label,
         scroll::{PropagatePointerWheel, scroll},
@@ -816,10 +816,22 @@ impl EditorView {
             (total_len * line_height) as f64
         };
 
-        let colors = changes_colors_all(&config, &self.editor.editor, changes);
-        for (y, height, _, color) in colors {
-            let y = y / content_height * total_height;
-            let height = ((height * line_height) as f64 / content_height
+        // Buffer lines like `content_height`, walking visual lines here cost
+        // a pass over the whole file every frame
+        let mut colors: Vec<(usize, usize, Color)> = Vec::new();
+        let mut line = 0;
+        for (len, color, modified) in changes_color_iter(&changes, &config) {
+            if let Some(color) = color {
+                if modified {
+                    colors.pop();
+                }
+                colors.push((line, len, color));
+            }
+            line += len;
+        }
+        for (line, len, color) in colors {
+            let y = (line * line_height) as f64 / content_height * total_height;
+            let height = ((len * line_height) as f64 / content_height
                 * total_height)
                 .max(3.0);
             let rect = Rect::ZERO.with_size(Size::new(3.0, height)).with_origin(
@@ -2667,62 +2679,6 @@ pub fn changes_colors_screen(
         }
 
         if line > max.line {
-            break;
-        }
-    }
-
-    colors
-}
-
-// TODO: limit the visual line that changes are considered past to some reasonable number
-// TODO(minor): This could be a `changes_colors_range` with some minor changes, but it isn't needed
-/// Get the position and coloring information for over the entire current [`ScreenLines`]
-/// Returns `(y, height_idx, removed, color)`
-pub fn changes_colors_all(
-    config: &LapceConfig,
-    ed: &Editor,
-    changes: im::Vector<DiffLines>,
-) -> Vec<(f64, usize, bool, Color)> {
-    let line_height = config.editor.line_height();
-
-    let mut line = 0;
-    let mut colors = Vec::new();
-
-    let mut vline_iter = ed.iter_vlines(false, VLine(0)).peekable();
-
-    for (len, color, modified) in changes_color_iter(&changes, config) {
-        let pre_line = line;
-
-        line += len;
-
-        // Skip over all vlines that are before the current line
-        vline_iter
-            .by_ref()
-            .peeking_take_while(|info| info.rvline.line < pre_line)
-            .count();
-
-        if let Some(color) = color {
-            if modified {
-                colors.pop();
-            }
-
-            // Find the info with a line == pre_line
-            let Some(info) = vline_iter.peek() else {
-                continue;
-            };
-
-            let y = info.vline.get() * line_height;
-            let end_line = info.rvline.line + len;
-            let height = vline_iter
-                .by_ref()
-                .peeking_take_while(|info| info.rvline.line < end_line)
-                .count();
-            let removed = len == 0;
-
-            colors.push((y as f64, height, removed, color));
-        }
-
-        if vline_iter.peek().is_none() {
             break;
         }
     }
